@@ -1,29 +1,28 @@
-import json
 import re
 import uuid
 from pathlib import Path
 
 from app.core.config import settings
+from app.models.asset import MODALITY_BY_EXTENSION, Asset
 from app.models.project import Project
 
-ALLOWED_EXTENSIONS = {
-    ".mp3",
-    ".wav",
-    ".mp4",
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".pdf",
-    ".txt",
-}
+ALLOWED_EXTENSIONS = set(MODALITY_BY_EXTENSION)
 
 
 class ProjectNotFoundError(Exception):
     pass
 
 
+class AssetNotFoundError(Exception):
+    pass
+
+
 class UnsupportedFileTypeError(Exception):
     pass
+
+
+def project_root() -> Path:
+    return Path(settings.data_dir).parent
 
 
 def _data_root() -> Path:
@@ -38,8 +37,16 @@ def _project_file(project_id: str) -> Path:
     return _project_dir(project_id) / "project.json"
 
 
-def _uploads_dir(project_id: str) -> Path:
+def uploads_dir(project_id: str) -> Path:
     return _project_dir(project_id) / "uploads"
+
+
+def _assets_dir(project_id: str) -> Path:
+    return _project_dir(project_id) / "assets"
+
+
+def _asset_file(project_id: str, asset_id: str) -> Path:
+    return _assets_dir(project_id) / f"{asset_id}.json"
 
 
 def create_project(name: str, description: str) -> Project:
@@ -47,7 +54,8 @@ def create_project(name: str, description: str) -> Project:
 
     project_dir = _project_dir(project.id)
     project_dir.mkdir(parents=True, exist_ok=True)
-    _uploads_dir(project.id).mkdir(parents=True, exist_ok=True)
+    uploads_dir(project.id).mkdir(parents=True, exist_ok=True)
+    _assets_dir(project.id).mkdir(parents=True, exist_ok=True)
 
     _project_file(project.id).write_text(project.model_dump_json(indent=2))
     return project
@@ -61,13 +69,14 @@ def get_project(project_id: str) -> Project:
     return Project.model_validate_json(project_file.read_text())
 
 
-def _safe_stored_filename(original_filename: str, extension: str) -> str:
+def safe_stored_filename(original_filename: str, extension: str) -> str:
     stem = Path(original_filename).stem
     safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_") or "file"
     return f"{uuid.uuid4().hex}_{safe_stem}{extension}"
 
 
-def save_upload(project_id: str, original_filename: str, content: bytes) -> dict:
+def write_uploaded_file(project_id: str, original_filename: str, content: bytes) -> dict:
+    """Validates project + extension, writes bytes to disk, returns write info."""
     # raises ProjectNotFoundError if missing
     get_project(project_id)
 
@@ -75,18 +84,46 @@ def save_upload(project_id: str, original_filename: str, content: bytes) -> dict
     if extension not in ALLOWED_EXTENSIONS:
         raise UnsupportedFileTypeError(extension)
 
-    uploads_dir = _uploads_dir(project_id)
-    uploads_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = uploads_dir(project_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
 
-    stored_filename = _safe_stored_filename(original_filename, extension)
-    stored_path = uploads_dir / stored_filename
-    stored_path.write_bytes(content)
+    stored_filename = safe_stored_filename(original_filename, extension)
+    absolute_path = target_dir / stored_filename
+    absolute_path.write_bytes(content)
 
     return {
-        "project_id": project_id,
-        "original_filename": original_filename,
+        "extension": extension,
         "stored_filename": stored_filename,
-        "stored_path": str(stored_path.relative_to(Path(settings.data_dir).parent)),
-        "file_type": extension.lstrip("."),
-        "size_bytes": len(content),
+        "absolute_path": absolute_path,
+        "relative_path": str(absolute_path.relative_to(project_root())),
     }
+
+
+def save_asset(asset: Asset) -> None:
+    assets_dir = _assets_dir(asset.project_id)
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    _asset_file(asset.project_id, asset.id).write_text(asset.model_dump_json(indent=2))
+
+
+def get_asset(project_id: str, asset_id: str) -> Asset:
+    get_project(project_id)
+
+    asset_file = _asset_file(project_id, asset_id)
+    if not asset_file.exists():
+        raise AssetNotFoundError(asset_id)
+
+    return Asset.model_validate_json(asset_file.read_text())
+
+
+def list_assets(project_id: str) -> list[Asset]:
+    get_project(project_id)
+
+    assets_dir = _assets_dir(project_id)
+    if not assets_dir.exists():
+        return []
+
+    assets = [
+        Asset.model_validate_json(asset_file.read_text())
+        for asset_file in sorted(assets_dir.glob("*.json"))
+    ]
+    return sorted(assets, key=lambda asset: asset.created_at)

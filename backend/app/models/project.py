@@ -20,12 +20,3 @@ class Project(BaseModel):
 class ProjectCreateRequest(BaseModel):
     name: str
     description: str = ""
-
-
-class UploadMetadata(BaseModel):
-    project_id: str
-    original_filename: str
-    stored_filename: str
-    stored_path: str
-    file_type: str
-    size_bytes: int

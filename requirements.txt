@@ -5,3 +5,8 @@ python-multipart==0.0.9
 streamlit==1.38.0
 requests==2.32.3
 python-dotenv==1.0.1
+Pillow==10.4.0
+mutagen==1.48.1
+pypdf==6.19.0
+hachoir==3.4.0
+charset-normalizer==3.5.1

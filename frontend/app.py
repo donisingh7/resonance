@@ -98,7 +98,37 @@ if active_project:
                 st.error(f"{uploaded_file.name}: could not reach backend: {exc}")
 
         if results:
-            st.success(f"Uploaded {len(results)} file(s).")
-            st.table(results)
+            st.success(f"Uploaded and ingested {len(results)} file(s).")
+
+    st.subheader("Ingested assets")
+    if st.button("Refresh assets"):
+        pass  # button click alone triggers a rerun, which re-fetches below
+
+    try:
+        resp = requests.get(
+            f"{BACKEND_URL}/projects/{active_project['id']}/assets", timeout=5
+        )
+        if resp.status_code == 200:
+            assets = resp.json()
+            if assets:
+                rows = [
+                    {
+                        "id": a["id"],
+                        "original_filename": a["original_filename"],
+                        "modality": a["modality"],
+                        "mime_type": a["mime_type"],
+                        "size_bytes": a["size_bytes"],
+                        "ingestion_status": a["ingestion_status"],
+                        "technical_metadata": a["technical_metadata"],
+                    }
+                    for a in assets
+                ]
+                st.table(rows)
+            else:
+                st.info("No assets ingested yet for this project.")
+        else:
+            st.error(f"Failed to load assets: {resp.status_code} {resp.text}")
+    except requests.exceptions.RequestException as exc:
+        st.error(f"Could not reach backend: {exc}")
 else:
     st.info("Create or load a project to upload files.")
