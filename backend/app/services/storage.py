@@ -7,6 +7,8 @@ from app.models.asset import MODALITY_BY_EXTENSION, Asset
 from app.models.intelligence import ProjectIntelligence
 from app.models.processing import ProcessingResult
 from app.models.project import Project
+from app.models.questionnaire import Questionnaire
+from app.models.report import ExecutiveReport
 
 ALLOWED_EXTENSIONS = set(MODALITY_BY_EXTENSION)
 
@@ -24,6 +26,14 @@ class ProcessingResultNotFoundError(Exception):
 
 
 class ProjectIntelligenceNotFoundError(Exception):
+    pass
+
+
+class QuestionnaireNotFoundError(Exception):
+    pass
+
+
+class ReportNotFoundError(Exception):
     pass
 
 
@@ -75,6 +85,26 @@ def _intelligence_file(project_id: str, intelligence_id: str) -> Path:
     return _intelligence_dir(project_id) / f"{intelligence_id}.json"
 
 
+def _questionnaires_dir(project_id: str) -> Path:
+    return _project_dir(project_id) / "questionnaires"
+
+
+def _questionnaire_file(project_id: str, questionnaire_id: str) -> Path:
+    return _questionnaires_dir(project_id) / f"{questionnaire_id}.json"
+
+
+def _reports_dir(project_id: str) -> Path:
+    return _project_dir(project_id) / "reports"
+
+
+def _report_file(project_id: str, report_id: str) -> Path:
+    return _reports_dir(project_id) / f"{report_id}.json"
+
+
+def report_pdf_path(project_id: str, report_id: str) -> Path:
+    return _reports_dir(project_id) / f"{report_id}.pdf"
+
+
 def runtime_tmp_dir() -> Path:
     """Scratch space for transient files (e.g. video keyframe/audio extraction).
 
@@ -95,6 +125,8 @@ def create_project(name: str, description: str) -> Project:
     _assets_dir(project.id).mkdir(parents=True, exist_ok=True)
     _processing_results_dir(project.id).mkdir(parents=True, exist_ok=True)
     _intelligence_dir(project.id).mkdir(parents=True, exist_ok=True)
+    _questionnaires_dir(project.id).mkdir(parents=True, exist_ok=True)
+    _reports_dir(project.id).mkdir(parents=True, exist_ok=True)
 
     _project_file(project.id).write_text(project.model_dump_json(indent=2), encoding="utf-8")
     return project
@@ -230,5 +262,69 @@ def list_project_intelligence(project_id: str) -> list[ProjectIntelligence]:
     results = [
         ProjectIntelligence.model_validate_json(intelligence_file.read_text(encoding="utf-8"))
         for intelligence_file in sorted(intelligence_dir.glob("*.json"))
+    ]
+    return sorted(results, key=lambda result: result.created_at)
+
+
+def save_questionnaire(questionnaire: Questionnaire) -> None:
+    questionnaires_dir = _questionnaires_dir(questionnaire.project_id)
+    questionnaires_dir.mkdir(parents=True, exist_ok=True)
+    _questionnaire_file(questionnaire.project_id, questionnaire.id).write_text(
+        questionnaire.model_dump_json(indent=2), encoding="utf-8"
+    )
+
+
+def get_questionnaire(project_id: str, questionnaire_id: str) -> Questionnaire:
+    get_project(project_id)
+
+    questionnaire_file = _questionnaire_file(project_id, questionnaire_id)
+    if not questionnaire_file.exists():
+        raise QuestionnaireNotFoundError(questionnaire_id)
+
+    return Questionnaire.model_validate_json(questionnaire_file.read_text(encoding="utf-8"))
+
+
+def list_questionnaires(project_id: str) -> list[Questionnaire]:
+    get_project(project_id)
+
+    questionnaires_dir = _questionnaires_dir(project_id)
+    if not questionnaires_dir.exists():
+        return []
+
+    results = [
+        Questionnaire.model_validate_json(questionnaire_file.read_text(encoding="utf-8"))
+        for questionnaire_file in sorted(questionnaires_dir.glob("*.json"))
+    ]
+    return sorted(results, key=lambda result: result.created_at)
+
+
+def save_report(report: ExecutiveReport) -> None:
+    reports_dir = _reports_dir(report.project_id)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    _report_file(report.project_id, report.id).write_text(
+        report.model_dump_json(indent=2), encoding="utf-8"
+    )
+
+
+def get_report(project_id: str, report_id: str) -> ExecutiveReport:
+    get_project(project_id)
+
+    report_file = _report_file(project_id, report_id)
+    if not report_file.exists():
+        raise ReportNotFoundError(report_id)
+
+    return ExecutiveReport.model_validate_json(report_file.read_text(encoding="utf-8"))
+
+
+def list_reports(project_id: str) -> list[ExecutiveReport]:
+    get_project(project_id)
+
+    reports_dir = _reports_dir(project_id)
+    if not reports_dir.exists():
+        return []
+
+    results = [
+        ExecutiveReport.model_validate_json(report_file.read_text(encoding="utf-8"))
+        for report_file in sorted(reports_dir.glob("*.json"))
     ]
     return sorted(results, key=lambda result: result.created_at)

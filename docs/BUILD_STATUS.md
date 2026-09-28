@@ -1,148 +1,199 @@
 # Resonance — Build Status
 
-Last updated: 2026-09-28 (S4 / R3 — unified cross-asset intelligence + evidence traceability, mock provider)
+Last updated: 2026-09-28 (S5 / R4 — questionnaire generation + executive reporting + risk/moderation flags, mock provider)
 
 ## Implemented
 
 **Backend (FastAPI, `backend/app/`)**
 - `GET /health`
 - `POST /projects`, `GET /projects/{project_id}`
-- `POST /projects/{project_id}/upload` — ingests into an `Asset` (unchanged from S2)
-- `GET /projects/{project_id}/assets`, `GET /projects/{project_id}/assets/{asset_id}`
-- `POST /projects/{project_id}/assets/{asset_id}/process` — processes one
-  asset per its modality and returns a `ProcessingResult` (unchanged from S3)
-- `GET /projects/{project_id}/processing-results`, `GET .../processing-results/{result_id}`
-- **New: `POST /projects/{project_id}/intelligence`** — generates
-  project-level intelligence across all of that project's *completed*
-  `ProcessingResult`s. Optional JSON body `{"provider": "mock"}` to override
-  the default provider; body may be omitted/empty. Re-running this for the
-  same project/provider overwrites the previous result rather than creating
-  a duplicate (deterministic `uuid5(project_id, provider_name)` id) — the
-  same idempotency strategy as asset processing, applied one level up.
-- **New: `GET /projects/{project_id}/intelligence`** — lists all generated
-  intelligence results for a project, sorted by `created_at`.
-- **New: `GET /projects/{project_id}/intelligence/{intelligence_id}`**
+- `POST /projects/{project_id}/upload`, `GET .../assets`, `GET .../assets/{asset_id}` (unchanged)
+- `POST /projects/{project_id}/assets/{asset_id}/process`, `GET .../processing-results`,
+  `GET .../processing-results/{result_id}` (unchanged from S3)
+- `POST/GET /projects/{project_id}/intelligence`, `GET .../intelligence/{intelligence_id}` (unchanged from S4)
+- **New: `POST /projects/{project_id}/questionnaires`** — generates a
+  follow-up `Questionnaire` from a project's intelligence. Optional JSON
+  body `{"provider": "mock", "intelligence_id": "..."}`; if `intelligence_id`
+  is omitted, the most recently generated `ProjectIntelligence` for the
+  project is used. Returns `400` if the project has no intelligence at all
+  and none was specified. Idempotent: `uuid5(intelligence_id, provider_name)`
+  — regenerating for the same intelligence/provider overwrites the previous
+  questionnaire (including any manual edits).
+- **New: `GET /projects/{project_id}/questionnaires`** — lists all
+  questionnaires for a project, sorted by `created_at`.
+- **New: `GET /projects/{project_id}/questionnaires/{questionnaire_id}`**
+- **New: `PUT /projects/{project_id}/questionnaires/{questionnaire_id}`** —
+  replaces the `questions` list (full array) for manual editing. Preserves
+  `id`/`project_id`/`intelligence_id`/`provider`/`status`/`created_at`;
+  bumps `updated_at`.
+- **New: `POST /projects/{project_id}/reports`** — generates an
+  `ExecutiveReport` from a project's intelligence (and, if one exists for
+  that intelligence, its questionnaire). Optional JSON body
+  `{"intelligence_id": "...", "questionnaire_id": "..."}`; both default to
+  "most recent for this project/intelligence" when omitted. Idempotent:
+  `uuid5(intelligence_id)` — regenerating overwrites the previous report
+  and its PDF file.
+- **New: `GET /projects/{project_id}/reports`** — lists all reports for a
+  project, sorted by `created_at`.
+- **New: `GET /projects/{project_id}/reports/{report_id}`**
+- **New: `GET /projects/{project_id}/reports/{report_id}/pdf`** — streams
+  the rendered PDF (`404` if the report has none, e.g. rendering failed).
 
-**ProjectIntelligence model (`backend/app/models/intelligence.py`)**
-`id, project_id, status (completed|failed), provider, created_at,
-source_result_ids, summary, top_themes, sentiment_summary, pain_points,
+**Questionnaire model (`backend/app/models/questionnaire.py`)**
+`Questionnaire`: `id, project_id, intelligence_id, provider, status
+(completed|failed), created_at, updated_at, questions, error`.
+`Question`: `id, question_type (likert|multiple_choice|free_text|yes_no),
+text, rationale, related_theme, required, options`. `related_theme`, when
+set, is always literal text copied from the source `ProjectIntelligence`
+(a theme, pain point, concern, opportunity, or the sentiment summary) — the
+generation logic never invents a new signal, it only reformulates existing
+intelligence output into follow-up prompts.
+
+**ExecutiveReport model (`backend/app/models/report.py`)**
+`id, project_id, intelligence_id, questionnaire_id, status
+(completed|failed), provider, created_at, executive_summary,
+source_coverage, overall_sentiment, top_themes, pain_points,
 positive_signals, questions_or_concerns, opportunities,
-recommended_actions, evidence, processing_metadata, error`.
-`source_result_ids` lists exactly the `ProcessingResult` ids whose content
-fed the synthesis (i.e. completed results with non-empty extracted
-text/transcript/visual description). `processing_metadata` records
-transparency counts: total/completed processing results considered, ids of
-failed results, ids of completed-but-empty-content results, whether the
-per-project asset cap was hit, plus whatever metadata the provider itself
-returns (e.g. `mock: true`, `asset_count`, `total_input_characters`).
+recommended_actions, evidence, questionnaire_summary, risk_flags,
+pdf_path, error`. Every factual section (themes, pain points, evidence,
+etc.) is copied **verbatim** from the source `ProjectIntelligence` — the
+report service never regenerates or reinterprets content, so evidence
+traceability (`EvidenceItem`: category, statement, asset_id,
+processing_result_id, source_filename, excerpt) is preserved automatically
+with no new invented evidence. `provider` is copied from the source
+intelligence (e.g. `"mock"`), since generating a report doesn't itself call
+an AI provider — it's a structured repackaging step.
 
-**EvidenceItem model** — `category, statement, asset_id,
-processing_result_id, source_filename, excerpt`. Every evidence item
-returned by a provider is validated against the actual source-result ids
-used for that generation before being persisted; anything that doesn't
-match a real id in the input set is dropped rather than trusted. No
-evidence is ever fabricated: `excerpt`, when present, is always a verbatim
-substring of the corresponding asset's own processed text.
+**Risk/moderation flags (`RiskFlag`: code, severity, message, details)** —
+deterministic, rule-based pipeline/data-quality checks computed from real
+counts already on the `ProjectIntelligence`/project state. **Explicitly not
+a content-moderation or safety classifier** — no keyword-based judgment of
+the content itself is performed. Flags implemented:
+| Code | Severity | Trigger |
+|---|---|---|
+| `intelligence_generation_failed` | critical | source intelligence `status == "failed"` |
+| `no_assets` | critical | project has zero uploaded assets |
+| `no_source_coverage` | critical | assets exist but zero contributed usable content |
+| `low_source_coverage` | warning | fewer than half the project's assets contributed |
+| `processing_failures` | warning | one or more processing results failed and were excluded |
+| `empty_content_excluded` | info | one or more completed results had no usable text |
+| `asset_context_capped` | info | project exceeded the S4 per-run analysis cap |
+| `insufficient_supporting_evidence` | warning | content exists but no evidence items were generated |
+| `mock_provider_output` | warning | the source intelligence's provider is `"mock"` (always true this phase) |
+| `no_questionnaire_generated` | info | no questionnaire exists yet for this intelligence |
+| `questionnaire_generation_failed` | warning | a questionnaire exists but its status is `"failed"` |
+| `pdf_generation_failed` | warning | PDF rendering raised an exception (isolated, doesn't fail the report) |
 
-**AI provider abstraction (`backend/app/services/ai_providers/`)** — extended for S4:
-- `base.py` — `AIProvider` interface gains `synthesize_project(assets:
-  list[ProjectAssetContext]) -> ProjectSynthesisResult`, alongside the
-  existing `transcribe_audio`/`analyze_image`. `ProjectAssetContext` is one
-  asset's bounded text plus its ids/filename/modality; `ProjectEvidenceItem`
-  and `ProjectSynthesisResult` define the structured synthesis + evidence
-  shape every provider (mock or future real) must return.
-- `mock_provider.py` — `MockAIProvider.synthesize_project()` is a
-  **deterministic, keyword-heuristic** synthesis: word-frequency counting
-  (minus a stopword list that also filters the mock provider's own
-  transcript/description boilerplate) for `top_themes`; fixed pain/positive
-  keyword lists for `pain_points`/`positive_signals`; sentence-level `?`
-  detection for `questions_or_concerns`; templated `opportunities` and
-  `recommended_actions` derived from the above. Every generated item that
-  cites content is paired with a real excerpt found via substring search in
-  the actual asset text — nothing is invented. All output is clearly
-  labeled `[mock ...]` / `[mock sentiment]` / `[mock project synthesis]`,
-  and is explicitly **not** real AI analysis — it exists to verify the
-  end-to-end architecture, not to produce a good-quality reading of content.
+**AI provider abstraction (`backend/app/services/ai_providers/`)** — extended for S5:
+- `base.py` — `AIProvider` gains `generate_questionnaire(intelligence:
+  IntelligenceContext) -> QuestionnaireGenerationResult`. `IntelligenceContext`
+  is the subset of an already-generated `ProjectIntelligence`'s fields
+  (summary, themes, sentiment, pain points, positive signals, concerns,
+  opportunities) — no raw asset text is re-read for questionnaire
+  generation, only the already-synthesized S4 output.
+- `mock_provider.py` — `MockAIProvider.generate_questionnaire()` is
+  deterministic: one `multiple_choice` question per top theme (up to 3),
+  one `likert` question per pain point (up to 5), one `free_text` question
+  per open question/concern (up to 3), one `yes_no` question per
+  opportunity (up to 2), one `yes_no` sentiment-validation question, and
+  one always-included closing `free_text` "anything else?" question.
+  MockAIProvider's own "[mock] No X detected..." placeholder strings (from
+  S4, when a bucket found nothing) are filtered out before question
+  generation so the questionnaire doesn't ask about a non-finding.
 - `__init__.py` — unchanged factory; no new provider implemented this phase.
 
-**Cross-asset consolidation service (`backend/app/services/intelligence.py`, S4)**
-`generate_project_intelligence(project_id, provider_name=None)`:
-1. Loads the project's `ProcessingResult`s; splits into completed / failed.
-2. Builds a bounded per-asset text context from completed results only:
-   `transcript` + `extracted_text` + `visual_description` joined, truncated
-   to 4000 chars/asset, capped at 50 assets total (`MAX_CHARS_PER_ASSET`,
-   `MAX_ASSETS_IN_CONTEXT` in `intelligence.py`). Completed results with no
-   usable text (e.g. a video with no audio and no meaningful frame text) are
-   skipped and recorded in `processing_metadata.empty_content_result_ids`,
-   not silently dropped.
-3. If no asset yields usable context (no processed assets yet, or a project
-   with only failed/empty results), returns a `status="completed"`
-   `ProjectIntelligence` with an explanatory `summary` and empty
-   lists/evidence, rather than erroring — a project with nothing processed
-   yet is a normal state, not a failure.
-4. Otherwise calls `provider.synthesize_project(contexts)`, validates
-   returned evidence against the real context ids, and persists the result.
-   A provider exception here is caught and turned into a `status="failed"`
-   `ProjectIntelligence` with an `error` message — mirrors how
-   `processing.py` handles a per-asset provider failure — so one bad
-   generation never corrupts the project or a prior successful result.
+**Questionnaire service (`backend/app/services/questionnaire.py`, S5)**
+`generate_questionnaire(project_id, intelligence_id=None, provider_name=None)`:
+resolves the target intelligence via `intelligence.resolve_intelligence()`
+(shared with the report service), calls
+`provider.generate_questionnaire()`, and persists the result. A provider
+exception is caught and turned into `status="failed"`, mirroring
+`processing.py`/`intelligence.py`. `update_questionnaire(project_id,
+questionnaire_id, questions)` replaces the question list for manual edits.
 
-**Persistence** — extended: `data/projects/{project_id}/intelligence/{intelligence_id}.json`
-alongside the existing `project.json`, `uploads/`, `assets/`,
-`processing_results/`. `storage.py` now explicitly opens all JSON files
-with `encoding="utf-8"` (previously relied on the OS default, which is
-`cp1252` on Windows and cannot represent characters like `→` that can
-appear in generated summary text — this was a latent cross-platform bug,
-fixed as part of this phase since S4 output was the first content to
-trigger it).
+**Report service (`backend/app/services/report.py`, S5)**
+`generate_report(project_id, intelligence_id=None, questionnaire_id=None)`:
+resolves the target intelligence and (optionally) its questionnaire,
+builds `source_coverage` from real counts (`storage.list_assets` +
+`ProjectIntelligence.processing_metadata`), builds a templated
+`[mock report]`-labeled executive summary, computes risk flags, and
+attempts PDF rendering — a PDF failure is caught and recorded as a
+`pdf_generation_failed` risk flag rather than failing the whole report.
 
-**Frontend (Streamlit, `frontend/app.py`)**
-- Unchanged: health check, create/load project, multi-file upload, asset
-  list with per-asset "Process asset" and result display.
-- **New "Project intelligence" section** on the active project page:
-  - Shows asset count and how many have a completed processing result.
-  - **"Generate Project Intelligence"** button (calls `POST .../intelligence`).
-  - Lists all generated intelligence records (newest first, latest
-    expanded), each showing: a "MockAIProvider output ... not real AI
-    analysis" caption when `provider == "mock"`, summary, top themes, pain
-    points, opportunities, sentiment summary, positive signals, recommended
-    actions, questions/concerns, and every evidence item (category,
-    statement, source filename, asset/result id, excerpt) plus the list of
-    source processing-result ids.
-  - A `status == "failed"` record shows its `error` instead of empty
-    sections.
+**PDF rendering (`backend/app/services/report_pdf.py`, S5)** — uses
+`reportlab` (pure-Python, no system dependency) to render an
+`ExecutiveReport` to PDF: title, executive summary, a coverage table, all
+list sections as bullet lists, every evidence item with its source
+filename/asset id/result id/excerpt, the questionnaire summary, and all
+risk flags. Every dynamic string is XML-escaped before being placed in a
+`reportlab` `Paragraph` (whose markup is a small XML dialect) so that real
+content containing `&`/`<`/`>` can't raise a parse error and crash report
+generation. **Dependency check performed before use**: `reportlab` was not
+already present in the project's `.venv`; it was installed there only
+(`pip install reportlab` inside `.venv`, never touching the machine's
+global Python environment) and succeeded on the first attempt, so the PDF
+path is fully available this phase — no HTML/Markdown fallback was needed.
+
+**Persistence** — extended: `data/projects/{project_id}/questionnaires/{questionnaire_id}.json`
+and `data/projects/{project_id}/reports/{report_id}.json` (+ sibling
+`{report_id}.pdf` when rendering succeeds), alongside the existing
+`project.json`, `uploads/`, `assets/`, `processing_results/`,
+`intelligence/`. All new persistence uses `encoding="utf-8"` explicitly,
+consistent with the S4 fix.
+
+**Frontend (Streamlit, `frontend/app.py`)** — two new sections on the
+active project page, after the existing "Project intelligence" section:
+- **"Follow-up questionnaire"**: "Generate follow-up questionnaire" button;
+  each questionnaire is shown in an expander with a "MockAIProvider output"
+  caption when applicable, and an editable form per questionnaire (text,
+  type, required, comma-separated options per question, with rationale/
+  related-theme shown read-only for traceability) plus a "Save
+  questionnaire" button that `PUT`s the edited list.
+- **"Executive report"**: "Generate executive report" button; each report
+  is shown in an expander with a "Download PDF" link-button (hidden if no
+  PDF was generated), all risk flags rendered via `st.error`/`st.warning`/
+  `st.info` by severity, executive summary, source/asset coverage JSON, all
+  list sections, questions/concerns, the linked questionnaire summary, and
+  every evidence item with its source/asset/result ids and excerpt.
 
 ## Current architecture
 
 ```
 resonance/
 ├── backend/app/
-│   ├── main.py                    # + intelligence router
+│   ├── main.py                    # + questionnaires, reports routers
 │   ├── api/
 │   │   ├── health.py
 │   │   ├── projects.py
-│   │   ├── assets.py              # + POST /assets/{id}/process
-│   │   ├── processing_results.py  # GET list + GET by id
-│   │   └── intelligence.py        # POST / GET list / GET by id (S4)
-│   ├── core/config.py             # ai_provider, ai_api_key settings (unchanged)
+│   │   ├── assets.py
+│   │   ├── processing_results.py
+│   │   ├── intelligence.py
+│   │   ├── questionnaires.py      # POST / GET list / GET / PUT (S5)
+│   │   └── reports.py             # POST / GET list / GET / GET pdf (S5)
+│   ├── core/config.py
 │   ├── models/
 │   │   ├── project.py
 │   │   ├── asset.py
-│   │   ├── processing.py          # ProcessingResult, ProcessingStatus
-│   │   └── intelligence.py        # ProjectIntelligence, EvidenceItem (S4)
+│   │   ├── processing.py
+│   │   ├── intelligence.py        # ProjectIntelligence, EvidenceItem
+│   │   ├── questionnaire.py       # Questionnaire, Question (S5)
+│   │   └── report.py              # ExecutiveReport, RiskFlag (S5)
 │   └── services/
-│       ├── storage.py             # + intelligence persistence, utf-8 everywhere
+│       ├── storage.py             # + questionnaire/report persistence
 │       ├── ingestion.py
-│       ├── processing.py          # per-modality orchestration (S3)
-│       ├── intelligence.py        # cross-asset consolidation service (S4)
-│       ├── video_tools.py         # ffmpeg/ffprobe subprocess wrappers
+│       ├── processing.py
+│       ├── intelligence.py        # + resolve_intelligence() shared helper
+│       ├── questionnaire.py       # follow-up questionnaire service (S5)
+│       ├── report.py              # executive report + risk flags (S5)
+│       ├── report_pdf.py          # reportlab PDF rendering (S5)
+│       ├── video_tools.py
 │       └── ai_providers/
-│           ├── base.py            # + ProjectAssetContext/Result, synthesize_project
-│           ├── mock_provider.py   # + synthesize_project() keyword heuristic
-│           └── __init__.py        # get_ai_provider() factory
-├── frontend/app.py                # + "Project intelligence" section
-├── data/                          # gitignored, runtime (includes data/tmp/)
-├── requirements.txt
+│           ├── base.py            # + generate_questionnaire, IntelligenceContext
+│           ├── mock_provider.py   # + generate_questionnaire() heuristic
+│           └── __init__.py
+├── frontend/app.py                # + questionnaire + report sections
+├── data/                          # gitignored, runtime (incl. report PDFs)
+├── requirements.txt                # + reportlab==5.0.1
 ├── .env.example
 ├── CLAUDE.md
 └── docs/BUILD_STATUS.md
@@ -150,63 +201,86 @@ resonance/
 
 ## Known limitations
 
-- **All project intelligence output from `MockAIProvider` is deterministic,
-  keyword-heuristic placeholder synthesis, not real AI analysis.** Themes
-  come from word-frequency counting, sentiment/pain/positive signals from
-  fixed keyword lists, and questions from `?` detection — not an LLM. This
-  is by design for this phase (architecture/flow verification), not an
-  oversight, and every mock output is clearly labeled as such.
-- Mock synthesis quality is intentionally not tuned further: audio/image/
-  video assets still only contribute `MockAIProvider`'s placeholder
-  transcript/description text (from S3), so real signal in this phase comes
-  primarily from PDF/TXT documents' genuinely extracted text.
-- The per-project synthesis context is bounded (4000 chars/asset, 50 assets
-  max) for predictability; a project exceeding the asset cap has
-  `processing_metadata.asset_context_capped = true` and only its first 50
-  completed results (by creation order) are considered.
-- `list_project_intelligence` / `list_processing_results` / `list_assets`
-  read every file per request — fine at current scale, same trade-off noted
-  in S3.
-- No questionnaire generation, executive/PDF report, embeddings, vector
-  search, or RAG yet — deliberately deferred from this phase.
+- **All questionnaire and report content is deterministic mock output**,
+  not real AI analysis — themes/questions come from the same S4 keyword
+  heuristics, questions are templated per-bucket, and the executive summary
+  is a fixed template. Every mock-derived piece of text is labeled
+  `[mock]` / `[mock report]` and the UI shows an explicit "MockAIProvider
+  output" caption; the `mock_provider_output` risk flag makes this
+  unavoidable to notice in the report itself too.
+- Risk/moderation flags are pipeline/data-quality checks only — there is
+  **no content-moderation or safety classifier** in this phase, by design
+  (the task explicitly called for trustworthy-pipeline flags first; adding
+  a keyword-based "safety" rule was deliberately skipped rather than
+  building something that could be mistaken for real moderation).
+  `questionnaire.py`'s `related_theme` values are grounded in real
+  `ProjectIntelligence` text, not raw asset content, but that intelligence
+  text is itself S4's keyword-heuristic mock output, not human review.
+- Editing a questionnaire only replaces the full `questions` array (no
+  partial-field patch, no add/remove-question endpoint distinct from
+  resending the array) — simplest approach given file-based storage and no
+  concurrent-editor concerns at this stage.
+- Regenerating a questionnaire or report overwrites the previous one for
+  that intelligence/provider, **including manual questionnaire edits** —
+  same idempotency strategy as S3/S4, applied consistently, but worth
+  knowing before clicking "Generate" again after editing.
+- A report's `provider` is inherited from its source intelligence; there is
+  no independent "generate this report with a different provider" option,
+  since generating a report doesn't call a provider itself.
+- No questionnaire/report versioning or diffing — each is a single current
+  snapshot per (intelligence, provider).
 - No authentication, no database, no queues, no containerization/deployment.
 - No automated test suite — verified via one manual smoke pass (see below).
 
 ## Smoke-tested this phase
 
-Backend started locally (isolated virtualenv); full flow exercised via
-scripted HTTP calls against a running instance:
-- A project with two uploaded/processed TXT assets → generated project
-  intelligence: `status="completed"`, `source_result_ids` has both results,
-  evidence present, every evidence item's `asset_id`/`processing_result_id`
-  matches a real uploaded asset/result and `source_filename` matches the
-  real uploaded filename.
-- A project with **no** processing results → intelligence generation
-  returns `status="completed"` with an explanatory empty summary, not an
-  error.
-- A project with a **mixture** of one completed TXT result and one failed
-  (deliberately corrupt "PDF") result → intelligence generation succeeds,
-  uses only the completed result's content, and records the failed result's
-  id in `processing_metadata.failed_result_ids` while excluding it from
-  `source_result_ids`.
-- `GET` by id and `GET` list both verified against a generated record.
-- **Idempotency**: regenerating intelligence for the same project (default
-  provider) returns the same `id` and the list endpoint still shows exactly
-  one record — no duplicate accumulation.
-- 404s verified for an unknown project and an unknown intelligence id.
-- Re-verified unaffected: health check, project create/get, upload,
-  asset list/get, asset processing (TXT/PDF), processing-result list/get —
-  all still return 200 with expected shapes.
+Backend started locally (`.venv`); full flow exercised via scripted HTTP
+calls against a running instance:
+- Re-verified unaffected: health check, project create/get, upload, asset
+  list/get, asset processing (TXT/PDF), processing-result list/get,
+  project intelligence generation — all still return 200 with expected
+  shapes.
+- Questionnaire generation on a project **with no intelligence yet**
+  returns `400` with a clear message rather than a crash or a nonsensical
+  empty questionnaire.
+- Questionnaire generation on a project with 2 processed TXT assets:
+  `status="completed"`, non-empty `questions`, every `related_theme`
+  verified (programmatically, in the smoke script) to be a literal
+  substring of the source `ProjectIntelligence`'s own themes/pain
+  points/concerns/opportunities/sentiment — no invented signal.
+- Questionnaire **idempotency**: regenerating returns the same `id`; list
+  endpoint still shows exactly 1 record.
+- Questionnaire **edit/save**: `PUT` with modified question text persists
+  the edit, preserves `created_at`, and bumps `updated_at`.
+- Executive report generation: evidence count matches the source
+  intelligence's evidence count exactly (verbatim carry-through); links the
+  generated questionnaire via `questionnaire_id`; includes the
+  `mock_provider_output` risk flag.
+- Report **idempotency**: regenerating returns the same `id`; list endpoint
+  still shows exactly 1 record.
+- **Mixed project** (one completed + one failed processing result):
+  report's risk flags correctly include `processing_failures` and (since no
+  questionnaire was generated for it) `no_questionnaire_generated`.
+- **Zero-asset project**: report generation succeeds (not an error) and
+  flags `no_assets`.
+- **Asset uploaded but never processed**: report generation succeeds and
+  flags `no_source_coverage` (distinct from `no_assets` — asset exists,
+  just never contributed content).
+- **PDF download**: verified `Content-Type: application/pdf`, a valid
+  `%PDF-` header, non-trivial size, and — via a separate manual render —
+  visually inspected the actual PDF pages to confirm all sections,
+  evidence, and risk flags render correctly and legibly.
+- 404s verified for an unknown questionnaire, an unknown report, and a
+  report-PDF request against an unknown project.
 - Streamlit booted successfully against the smoke-test backend and served
   its page with no server-side exceptions in the log.
-- Not re-tested this phase: audio/image/video asset processing (S3
-  functionality, unchanged code path) — the local dev machine's corporate
-  package mirror couldn't resolve the pinned `hachoir` version needed for
-  video metadata, an environment/dependency-mirror limitation unrelated to
-  the S4 code changes, not a regression.
+- Not re-tested this phase: audio/image/video asset processing (unchanged
+  S3 code path) — same pre-existing local `hachoir` mirror limitation noted
+  in the S4 build status, unrelated to S5 changes.
 
 ## Next phase (not started)
 
-Questionnaire generation, executive PDF report, final management report.
-Also not started: embeddings/vector database, RAG/semantic search, database
-migration, authentication, cloud deployment, queues, large UI redesign.
+Final recruiter-grade UI redesign, database migration, authentication,
+cloud deployment, embeddings/vector DB, RAG/semantic search, real external
+provider credentials, final evaluation benchmark, large automated test
+suite, async queues/background workers.

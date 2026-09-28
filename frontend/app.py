@@ -284,5 +284,246 @@ if active_project:
                         )
         else:
             st.error(f"Failed to load project intelligence: {intel_resp.status_code} {intel_resp.text}")
+
+    st.divider()
+    st.subheader("Follow-up questionnaire")
+
+    if st.button("Generate follow-up questionnaire"):
+        try:
+            qgen_resp = requests.post(
+                f"{BACKEND_URL}/projects/{active_project['id']}/questionnaires",
+                json={},
+                timeout=30,
+            )
+            if qgen_resp.status_code == 200:
+                st.success("Questionnaire generated.")
+                st.rerun()
+            elif qgen_resp.status_code == 400:
+                st.warning(qgen_resp.json().get("detail", "Generation failed."))
+            else:
+                st.error(f"Generation failed: {qgen_resp.status_code} {qgen_resp.text}")
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Could not reach backend: {exc}")
+
+    try:
+        questionnaires_resp = requests.get(
+            f"{BACKEND_URL}/projects/{active_project['id']}/questionnaires", timeout=5
+        )
+    except requests.exceptions.RequestException as exc:
+        questionnaires_resp = None
+        st.error(f"Could not reach backend: {exc}")
+
+    question_type_options = ["likert", "multiple_choice", "free_text", "yes_no"]
+
+    if questionnaires_resp is not None:
+        if questionnaires_resp.status_code == 200:
+            questionnaires = questionnaires_resp.json()
+            if not questionnaires:
+                st.info("No questionnaire generated yet.")
+            else:
+                questionnaires = sorted(
+                    questionnaires, key=lambda q: q["created_at"], reverse=True
+                )
+                for q in questionnaires:
+                    label = f"{q['provider']} — {q['status']} — {len(q['questions'])} question(s) — {q['created_at']}"
+                    with st.expander(label, expanded=(q is questionnaires[0])):
+                        if q["status"] == "failed":
+                            st.error(f"Questionnaire generation error: {q['error']}")
+                            continue
+
+                        if q["provider"] == "mock":
+                            st.caption(
+                                "MockAIProvider output: deterministic follow-up questions "
+                                "derived from mock project intelligence, not real AI-generated "
+                                "questions."
+                            )
+
+                        with st.form(f"edit_questionnaire_{q['id']}"):
+                            edited_questions = []
+                            for question in q["questions"]:
+                                st.markdown(f"**Question `{question['id'][:8]}`**")
+                                text = st.text_area(
+                                    "Text",
+                                    value=question["text"],
+                                    key=f"text_{question['id']}",
+                                )
+                                qtype = st.selectbox(
+                                    "Type",
+                                    question_type_options,
+                                    index=question_type_options.index(question["question_type"]),
+                                    key=f"type_{question['id']}",
+                                )
+                                required = st.checkbox(
+                                    "Required",
+                                    value=question["required"],
+                                    key=f"required_{question['id']}",
+                                )
+                                options_text = st.text_input(
+                                    "Options (comma-separated, blank for none)",
+                                    value=", ".join(question["options"] or []),
+                                    key=f"options_{question['id']}",
+                                )
+                                if question.get("related_theme"):
+                                    st.caption(f"Related theme: {question['related_theme']}")
+                                st.caption(f"Rationale: {question['rationale']}")
+                                st.markdown("---")
+
+                                options_list = (
+                                    [o.strip() for o in options_text.split(",") if o.strip()]
+                                    if options_text.strip()
+                                    else None
+                                )
+                                edited_questions.append(
+                                    {
+                                        "id": question["id"],
+                                        "question_type": qtype,
+                                        "text": text,
+                                        "rationale": question["rationale"],
+                                        "related_theme": question.get("related_theme"),
+                                        "required": required,
+                                        "options": options_list,
+                                    }
+                                )
+
+                            if st.form_submit_button("Save questionnaire"):
+                                try:
+                                    save_resp = requests.put(
+                                        f"{BACKEND_URL}/projects/{active_project['id']}"
+                                        f"/questionnaires/{q['id']}",
+                                        json={"questions": edited_questions},
+                                        timeout=15,
+                                    )
+                                    if save_resp.status_code == 200:
+                                        st.success("Questionnaire saved.")
+                                        st.rerun()
+                                    else:
+                                        st.error(
+                                            f"Save failed: {save_resp.status_code} {save_resp.text}"
+                                        )
+                                except requests.exceptions.RequestException as exc:
+                                    st.error(f"Could not reach backend: {exc}")
+        else:
+            st.error(
+                f"Failed to load questionnaires: "
+                f"{questionnaires_resp.status_code} {questionnaires_resp.text}"
+            )
+
+    st.divider()
+    st.subheader("Executive report")
+
+    if st.button("Generate executive report"):
+        try:
+            rgen_resp = requests.post(
+                f"{BACKEND_URL}/projects/{active_project['id']}/reports",
+                json={},
+                timeout=60,
+            )
+            if rgen_resp.status_code == 200:
+                st.success("Executive report generated.")
+                st.rerun()
+            elif rgen_resp.status_code == 400:
+                st.warning(rgen_resp.json().get("detail", "Generation failed."))
+            else:
+                st.error(f"Generation failed: {rgen_resp.status_code} {rgen_resp.text}")
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Could not reach backend: {exc}")
+
+    try:
+        reports_resp = requests.get(
+            f"{BACKEND_URL}/projects/{active_project['id']}/reports", timeout=5
+        )
+    except requests.exceptions.RequestException as exc:
+        reports_resp = None
+        st.error(f"Could not reach backend: {exc}")
+
+    severity_display = {"critical": "error", "warning": "warning", "info": "info"}
+
+    if reports_resp is not None:
+        if reports_resp.status_code == 200:
+            reports = reports_resp.json()
+            if not reports:
+                st.info("No executive report generated yet.")
+            else:
+                reports = sorted(reports, key=lambda r: r["created_at"], reverse=True)
+                for rep in reports:
+                    label = f"{rep['provider']} — {rep['status']} — {rep['created_at']}"
+                    with st.expander(label, expanded=(rep is reports[0])):
+                        if rep["provider"] == "mock":
+                            st.caption(
+                                "MockAIProvider output: this entire report is built from "
+                                "deterministic mock project intelligence, not real AI analysis."
+                            )
+
+                        if rep.get("pdf_path"):
+                            st.link_button(
+                                "Download PDF",
+                                url=f"{BACKEND_URL}/projects/{active_project['id']}"
+                                f"/reports/{rep['id']}/pdf",
+                            )
+                        else:
+                            st.caption("PDF not available for this report.")
+
+                        st.markdown("**Risk / data-quality flags**")
+                        if not rep["risk_flags"]:
+                            st.write("No flags raised.")
+                        for flag in rep["risk_flags"]:
+                            display_fn = getattr(st, severity_display.get(flag["severity"], "info"))
+                            display_fn(f"[{flag['code']}] {flag['message']}")
+
+                        st.markdown("**Executive summary**")
+                        st.write(rep["executive_summary"])
+
+                        st.markdown("**Source / asset coverage**")
+                        st.json(rep["source_coverage"])
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("**Top themes**")
+                            for item in rep["top_themes"]:
+                                st.write(f"- {item}")
+                            st.markdown("**Pain points**")
+                            for item in rep["pain_points"]:
+                                st.write(f"- {item}")
+                            st.markdown("**Opportunities**")
+                            for item in rep["opportunities"]:
+                                st.write(f"- {item}")
+                        with col2:
+                            st.markdown("**Overall sentiment**")
+                            st.write(rep["overall_sentiment"])
+                            st.markdown("**Positive signals**")
+                            for item in rep["positive_signals"]:
+                                st.write(f"- {item}")
+                            st.markdown("**Recommended actions**")
+                            for item in rep["recommended_actions"]:
+                                st.write(f"- {item}")
+
+                        st.markdown("**Questions / concerns**")
+                        for item in rep["questions_or_concerns"]:
+                            st.write(f"- {item}")
+
+                        st.markdown("**Follow-up questionnaire**")
+                        if rep.get("questionnaire_summary"):
+                            qs = rep["questionnaire_summary"]
+                            st.write(
+                                f"Questionnaire `{qs['questionnaire_id']}` — "
+                                f"{qs['question_count']} question(s), status: {qs['status']}."
+                            )
+                        else:
+                            st.write("No questionnaire was generated for this analysis.")
+
+                        st.markdown(f"**Supporting evidence** ({len(rep['evidence'])} item(s))")
+                        for evidence_item in rep["evidence"]:
+                            st.markdown(
+                                f"- **[{evidence_item['category']}]** {evidence_item['statement']}"
+                            )
+                            st.caption(
+                                f"Source: {evidence_item['source_filename']} · "
+                                f"asset_id={evidence_item['asset_id']} · "
+                                f"processing_result_id={evidence_item['processing_result_id']}"
+                            )
+                            if evidence_item.get("excerpt"):
+                                st.code(evidence_item["excerpt"], language=None)
+        else:
+            st.error(f"Failed to load reports: {reports_resp.status_code} {reports_resp.text}")
 else:
     st.info("Create or load a project to upload files.")

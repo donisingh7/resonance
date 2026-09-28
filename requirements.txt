@@ -10,3 +10,4 @@ mutagen==1.48.1
 pypdf==6.19.0
 hachoir==3.4.0
 charset-normalizer==3.5.1
+reportlab==5.0.1

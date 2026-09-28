@@ -52,6 +52,34 @@ class ProjectSynthesisResult(TypedDict):
     metadata: dict[str, Any]
 
 
+class IntelligenceContext(TypedDict):
+    """The already-generated ProjectIntelligence fields, as input to
+    questionnaire generation. No new asset text is re-read here — a
+    questionnaire is derived from intelligence output, not raw content."""
+
+    summary: str
+    top_themes: list[str]
+    sentiment_summary: str
+    pain_points: list[str]
+    positive_signals: list[str]
+    questions_or_concerns: list[str]
+    opportunities: list[str]
+
+
+class GeneratedQuestion(TypedDict):
+    question_type: str
+    text: str
+    rationale: str
+    related_theme: str | None
+    required: bool
+    options: list[str] | None
+
+
+class QuestionnaireGenerationResult(TypedDict):
+    questions: list[GeneratedQuestion]
+    metadata: dict[str, Any]
+
+
 class AIProvider(ABC):
     """Interface for AI-dependent operations (transcription, vision, synthesis).
 
@@ -82,4 +110,17 @@ class AIProvider(ABC):
         `ProjectEvidenceItem` returned must reference an `asset_id` /
         `processing_result_id` present in `assets`, with an excerpt (if any)
         drawn from that asset's own `text`.
+        """
+
+    @abstractmethod
+    def generate_questionnaire(
+        self, intelligence: IntelligenceContext
+    ) -> QuestionnaireGenerationResult:
+        """Generates a follow-up questionnaire from already-synthesized
+        project intelligence.
+
+        Implementations must not invent new signals: every generated
+        question's `related_theme` (when set) must be text that literally
+        appears in `intelligence` — a theme, pain point, concern, or
+        opportunity already produced by `synthesize_project`.
         """

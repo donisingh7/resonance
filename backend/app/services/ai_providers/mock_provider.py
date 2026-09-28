@@ -5,10 +5,13 @@ from typing import Any
 
 from app.services.ai_providers.base import (
     AIProvider,
+    GeneratedQuestion,
     ImageAnalysisResult,
+    IntelligenceContext,
     ProjectAssetContext,
     ProjectEvidenceItem,
     ProjectSynthesisResult,
+    QuestionnaireGenerationResult,
     TranscriptionResult,
 )
 
@@ -43,6 +46,13 @@ def _tokenize(text: str) -> set[str]:
 
 def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
+
+
+def _is_placeholder(text: str) -> bool:
+    """True for MockAIProvider's own 'nothing detected' filler strings
+    (e.g. "[mock] No pain-point keywords detected..."), so questionnaire
+    generation doesn't ask a follow-up question about a non-finding."""
+    return text.startswith("[mock] No ")
 
 
 def _find_excerpt(text: str, keyword: str, radius: int = 80) -> str:
@@ -273,4 +283,115 @@ class MockAIProvider(AIProvider):
             "recommended_actions": recommended_actions,
             "evidence": evidence,
             "metadata": metadata,
+        }
+
+    def generate_questionnaire(
+        self, intelligence: IntelligenceContext
+    ) -> QuestionnaireGenerationResult:
+        """Deterministic follow-up questionnaire derived from already-generated
+        ProjectIntelligence fields. Every question's `related_theme` is a
+        literal string taken from `intelligence` — no new signal is invented,
+        this only reformulates existing mock output into follow-up prompts.
+        """
+        questions: list[GeneratedQuestion] = []
+
+        likert_options = ["1 - Not significant", "2", "3", "4", "5 - Extremely significant"]
+        relevance_options = ["Highly relevant", "Somewhat relevant", "Not relevant", "Unsure"]
+        yes_no_options = ["Yes", "No"]
+
+        for theme in [t for t in intelligence["top_themes"] if not _is_placeholder(t)][:3]:
+            questions.append(
+                {
+                    "question_type": "multiple_choice",
+                    "text": f"[mock] How relevant is the following theme to your current priorities: \"{theme}\"?",
+                    "rationale": (
+                        f"[mock] Generated because the project intelligence flagged this as a "
+                        f"top theme: \"{theme}\"."
+                    ),
+                    "related_theme": theme,
+                    "required": True,
+                    "options": relevance_options,
+                }
+            )
+
+        for pain_point in [p for p in intelligence["pain_points"] if not _is_placeholder(p)][:5]:
+            questions.append(
+                {
+                    "question_type": "likert",
+                    "text": (
+                        f"[mock] On a scale of 1-5, how significant is this reported pain point "
+                        f"for you: \"{pain_point}\"?"
+                    ),
+                    "rationale": (
+                        f"[mock] Generated to validate a possible pain-point signal identified "
+                        f"in the project intelligence: \"{pain_point}\"."
+                    ),
+                    "related_theme": pain_point,
+                    "required": True,
+                    "options": likert_options,
+                }
+            )
+
+        for concern in [c for c in intelligence["questions_or_concerns"] if not _is_placeholder(c)][:3]:
+            questions.append(
+                {
+                    "question_type": "free_text",
+                    "text": f"[mock] Can you elaborate on this open question or concern: \"{concern}\"?",
+                    "rationale": (
+                        f"[mock] Generated to follow up on an unresolved question/concern noted "
+                        f"in the project intelligence: \"{concern}\"."
+                    ),
+                    "related_theme": concern,
+                    "required": False,
+                    "options": None,
+                }
+            )
+
+        for opportunity in [o for o in intelligence["opportunities"] if not _is_placeholder(o)][:2]:
+            questions.append(
+                {
+                    "question_type": "yes_no",
+                    "text": f"[mock] Should this opportunity be pursued further: \"{opportunity}\"?",
+                    "rationale": (
+                        f"[mock] Generated from an opportunity signal identified in the project "
+                        f"intelligence: \"{opportunity}\"."
+                    ),
+                    "related_theme": opportunity,
+                    "required": True,
+                    "options": yes_no_options,
+                }
+            )
+
+        if intelligence["sentiment_summary"]:
+            questions.append(
+                {
+                    "question_type": "yes_no",
+                    "text": (
+                        f"[mock] Does this sentiment assessment match your experience: "
+                        f"\"{intelligence['sentiment_summary']}\"?"
+                    ),
+                    "rationale": "[mock] Generated to validate the heuristic sentiment assessment.",
+                    "related_theme": intelligence["sentiment_summary"],
+                    "required": False,
+                    "options": yes_no_options,
+                }
+            )
+
+        questions.append(
+            {
+                "question_type": "free_text",
+                "text": "[mock] Is there any other context we should be aware of that wasn't captured above?",
+                "rationale": (
+                    "[mock] Always included to surface missing context not captured by the "
+                    "deterministic mock synthesis."
+                ),
+                "related_theme": None,
+                "required": False,
+                "options": None,
+            }
+        )
+
+        return {
+            "questions": questions,
+            "metadata": {"mock": True, "question_count": len(questions)},
         }

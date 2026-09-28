@@ -27,11 +27,15 @@ compatible licensing.
     `asset.py` (Asset, Modality, IngestionStatus, MODALITY_BY_EXTENSION — the single
     source of truth for which extensions are supported and their modality),
     `intelligence.py` (ProjectIntelligence, EvidenceItem, IntelligenceStatus —
-    the S4 cross-asset synthesis result and its evidence trail)
+    the S4 cross-asset synthesis result and its evidence trail),
+    `questionnaire.py` (Questionnaire, Question, QuestionType — the S5
+    follow-up questionnaire derived from a ProjectIntelligence), `report.py`
+    (ExecutiveReport, RiskFlag, RiskSeverity, QuestionnaireSummary — the S5
+    management-readable report, reusing `EvidenceItem` from `intelligence.py`)
   - `services/` — business logic / persistence:
     - `storage.py` — file-based persistence only (projects, assets,
-      processing results, project intelligence on disk). Owns the on-disk
-      layout; no metadata extraction or AI logic here.
+      processing results, project intelligence, questionnaires, reports on
+      disk). Owns the on-disk layout; no metadata extraction or AI logic here.
     - `ingestion.py` — the normalization/ingestion service. Turns raw upload
       bytes into an `Asset` (hashing, MIME guess, per-modality technical
       metadata extraction, no AI). Keep future modality-specific extraction
@@ -46,29 +50,58 @@ compatible licensing.
       text context (skipping empty content, capping asset count/chars),
       calls `provider.synthesize_project()`, and persists a
       `ProjectIntelligence`. Provider failures are caught and turned into a
-      `status="failed"` result, mirroring `processing.py`. All API-facing
-      logic for this phase lives here, not in `api/intelligence.py`.
+      `status="failed"` result, mirroring `processing.py`. Also exposes
+      `resolve_intelligence(project_id, intelligence_id)` — looks up a
+      specific intelligence result or the most recently generated one —
+      shared by `questionnaire.py` and `report.py` (S5) so both build on
+      the same resolution rule. All API-facing logic for this phase lives
+      here, not in `api/intelligence.py`.
+    - `questionnaire.py` — the follow-up questionnaire service (S5). Resolves
+      a `ProjectIntelligence` (specific or latest), calls
+      `provider.generate_questionnaire()` with only that intelligence's
+      already-generated fields (never re-reads raw asset text), and persists
+      a `Questionnaire`. Also owns `update_questionnaire()` for manual edits
+      (replaces the `questions` list, preserves `created_at`, bumps
+      `updated_at`).
+    - `report.py` — the executive report service (S5). Resolves the target
+      `ProjectIntelligence` and, if present, its `Questionnaire`; copies
+      their fields verbatim into an `ExecutiveReport` (so evidence
+      traceability carries over unchanged); computes deterministic,
+      rule-based `RiskFlag`s from real pipeline state (never a
+      content-moderation/safety classifier — see below); and attempts PDF
+      rendering via `report_pdf.py`, isolating a rendering failure to a risk
+      flag rather than failing the whole report.
+    - `report_pdf.py` — renders an `ExecutiveReport` to PDF using `reportlab`
+      (platypus). Every dynamic string is XML-escaped before being embedded
+      in a `Paragraph`, since reportlab's Paragraph markup is a small XML
+      dialect that would otherwise raise on real content containing
+      `&`/`<`/`>`.
     - `video_tools.py` — thin ffmpeg/ffprobe subprocess wrappers (probe
       duration, extract audio, extract keyframes). No AI, no persistence.
     - `ai_providers/` — provider abstraction: `base.py` (the `AIProvider`
-      interface: `transcribe_audio`, `analyze_image`, and — since S4 —
-      `synthesize_project` for cross-asset synthesis), `mock_provider.py`
-      (deterministic default, no external calls), `__init__.py`
-      (`get_ai_provider()` factory, provider selected via
-      `settings.ai_provider`). Add a real provider as a new module here
-      and register it in the factory; don't touch `processing.py`'s or
-      `intelligence.py`'s dispatch logic to add a provider.
+      interface: `transcribe_audio`, `analyze_image`, `synthesize_project`
+      (S4), and — since S5 — `generate_questionnaire` for follow-up
+      questions), `mock_provider.py` (deterministic default, no external
+      calls), `__init__.py` (`get_ai_provider()` factory, provider selected
+      via `settings.ai_provider`). Add a real provider as a new module here
+      and register it in the factory; don't touch `processing.py`'s,
+      `intelligence.py`'s, or `questionnaire.py`'s dispatch logic to add a
+      provider.
 - **Frontend**: Streamlit, single `frontend/app.py` for now. Talks to backend
   only via HTTP (`BACKEND_URL` env var), no direct imports from `backend/`.
 - **Persistence**: lightweight file-based, under `data/projects/{project_id}/`.
   No database yet. Each project has `project.json`, an `uploads/` subdirectory
   (raw stored files), an `assets/` subdirectory (one `{asset_id}.json` per
   ingested asset), a `processing_results/` subdirectory (one
-  `{result_id}.json` per processed asset), and an `intelligence/`
-  subdirectory (one `{intelligence_id}.json` per generated project
-  intelligence result). `data/tmp/` holds transient per-run scratch space
+  `{result_id}.json` per processed asset), an `intelligence/` subdirectory
+  (one `{intelligence_id}.json` per generated project intelligence result),
+  a `questionnaires/` subdirectory (one `{questionnaire_id}.json` per
+  generated/edited questionnaire), and a `reports/` subdirectory (one
+  `{report_id}.json` plus, when PDF rendering succeeds, a sibling
+  `{report_id}.pdf`). `data/tmp/` holds transient per-run scratch space
   (e.g. video keyframe/audio extraction); always clean it up in a `finally`
-  block after use. `data/` is gitignored (runtime data, not source).
+  block after use. `data/` is gitignored (runtime data, not source) — this
+  includes generated report PDFs, which are runtime artifacts, not source.
 - **All JSON persistence in `storage.py` reads/writes with `encoding="utf-8"`
   explicitly.** `Path.write_text`/`read_text` default to the OS locale
   encoding, which on Windows (cp1252) cannot represent arbitrary Unicode
@@ -85,6 +118,20 @@ compatible licensing.
   project/provider overwrites the previous result rather than
   accumulating duplicates — same idempotency strategy as processing
   results, applied one level up.
+- **Questionnaire ids are deterministic**: `uuid5` of `(intelligence_id,
+  provider_name)`. Regenerating a questionnaire for the same intelligence
+  result/provider overwrites the previous questionnaire — **including any
+  manual edits made via `PUT`** — same idempotency strategy, applied one
+  level up again. This is documented, known behavior, not a bug: generate
+  once, then edit; don't regenerate after editing unless you intend to
+  discard the edits. Editing itself (`PUT`) is not idempotent-by-id in this
+  sense — it always applies, preserving `created_at` and bumping `updated_at`.
+- **Report ids are deterministic**: `uuid5` of `intelligence_id` alone (no
+  provider — a report's `provider` field is copied from its source
+  intelligence, since a report doesn't call an AI provider itself, it only
+  reformats already-generated intelligence/questionnaire content).
+  Regenerating a report for the same intelligence result overwrites the
+  previous one (and its PDF file) rather than accumulating duplicates.
 - Routers are included in `backend/app/main.py`; keep new endpoints as new
   router modules under `api/`, not inline in `main.py`.
 - Never return absolute, machine-specific filesystem paths in API responses —
@@ -99,11 +146,14 @@ compatible licensing.
 - Metadata extraction (non-AI, technical only): Pillow (images), mutagen
   (audio), hachoir (video/mp4), pypdf (PDF page count/text), charset-normalizer
   (text encoding detection)
-- AI processing (S3) and cross-asset intelligence (S4): both
-  provider-abstracted (`ai_providers/`); `MockAIProvider` is the default and
-  only implemented provider — deterministic, no external calls or
-  credentials required. ffmpeg/ffprobe (system binaries, not pip packages)
-  used for video audio/keyframe extraction.
+- AI processing (S3), cross-asset intelligence (S4), and questionnaire
+  generation (S5): all provider-abstracted (`ai_providers/`); `MockAIProvider`
+  is the default and only implemented provider — deterministic, no external
+  calls or credentials required. ffmpeg/ffprobe (system binaries, not pip
+  packages) used for video audio/keyframe extraction.
+- PDF rendering (S5): `reportlab` (platypus), pure-Python, no system
+  dependency. Used only to render an already-built `ExecutiveReport` to
+  PDF — it has no role in generating report content.
 - No auth, no cloud deployment yet
 
 ## Coding rules
@@ -114,16 +164,30 @@ compatible licensing.
   a real cloud provider (credentials, Whisper, OCR, vision APIs, LLM calls)
   until explicitly scoped in a future phase — the interface exists so that
   can be added later without touching `processing.py`'s dispatch logic.
-- Processing (S3) is per-asset only; cross-asset synthesis (S4, see below)
-  is a separate service layer on top of it, not folded into `processing.py`.
-  Do not add embeddings, vector search, RAG, questionnaires, or executive
-  reporting until explicitly scoped.
+- Processing (S3) is per-asset only; cross-asset synthesis (S4) and
+  questionnaire/report generation (S5) are separate service layers on top
+  of it, not folded into `processing.py`. Do not add embeddings, vector
+  search, RAG, final management reports, or evaluation benchmarks until
+  explicitly scoped.
 - Cross-asset intelligence (S4) evidence must never be invented: every
   `EvidenceItem` persisted must reference a real `asset_id` /
   `processing_result_id` that was actually part of the synthesis input, and
   any `excerpt` must be a genuine substring of that asset's own processed
   text. `intelligence.py` defensively drops any evidence a provider returns
-  that doesn't reference an id from the input context.
+  that doesn't reference an id from the input context. Reports (S5) carry
+  this same evidence forward verbatim — never regenerate or reinterpret it.
+- Questionnaire generation (S5) must not invent new signals either: a
+  generated `Question.related_theme`, when set, must be literal text that
+  already appears in the source `ProjectIntelligence` (a theme, pain point,
+  concern, opportunity, or the sentiment summary) — never a paraphrase or a
+  bare category label. A questionnaire is a reformulation of existing
+  intelligence output into follow-up prompts, not a new analysis pass.
+- Risk/moderation flags (S5, `report.py`) are deterministic, rule-based
+  pipeline/data-quality checks only (processing failures, excluded/empty
+  assets, low source coverage, missing evidence, mock-provider output) —
+  **not** a content-moderation or safety classifier. Do not add a keyword-
+  based "safety" rule without labeling exactly how conservative/limited it
+  is; none is implemented as of S5.
 - No authentication, Docker, queues, or cloud deployment until explicitly
   scoped.
 - Validate inputs at API boundaries (e.g. file extension allowlist for
@@ -149,10 +213,16 @@ compatible licensing.
    is synthesized across a project's completed `ProcessingResult`s, with
    every insight traceable to source assets via `EvidenceItem`s. Still
    mock-only — no real LLM synthesis, no embeddings/vector search/RAG.
-4. Questionnaire generation / executive PDF report / management report —
-   not started, deliberately deferred from S4
-5. Persistent database layer (replacing file-based storage)
-6. Authentication & multi-user support
-7. Deployment (containerization, cloud hosting)
+4. ~~Questionnaire generation + executive reporting + risk flags~~ —
+   **done, mock-only** (S5/R4): a `Questionnaire` of follow-up questions is
+   generated from a `ProjectIntelligence` and is user-editable; an
+   `ExecutiveReport` packages that intelligence (plus the questionnaire, if
+   any) into management-readable sections with deterministic risk/
+   data-quality flags and, when `reportlab` is available, a downloadable
+   PDF. Still mock-only — see `docs/BUILD_STATUS.md` for exact scope.
+5. Final recruiter-grade UI redesign, database migration, authentication,
+   cloud deployment, embeddings/vector DB, RAG, real external provider
+   credentials, final evaluation benchmark — not started, deliberately
+   deferred from S5
 
 Do not start a phase early — follow explicit instructions per step.

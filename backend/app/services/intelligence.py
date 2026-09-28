@@ -27,6 +27,25 @@ def _extract_result_text(result: ProcessingResult) -> str:
     return "\n\n".join(parts).strip()
 
 
+def resolve_intelligence(project_id: str, intelligence_id: str | None) -> ProjectIntelligence:
+    """Looks up a specific intelligence result, or the most recently
+    generated one for the project if no id is given. Shared by the
+    questionnaire and report services so both build on the same intelligence
+    resolution rule. Raises storage.ProjectIntelligenceNotFoundError for an
+    unknown specific id, or ValueError if none was specified and the
+    project has no intelligence yet."""
+    if intelligence_id:
+        return storage.get_project_intelligence(project_id, intelligence_id)
+
+    existing = storage.list_project_intelligence(project_id)
+    if not existing:
+        raise ValueError(
+            "No project intelligence found for this project. Generate project "
+            "intelligence first."
+        )
+    return existing[-1]
+
+
 def generate_project_intelligence(
     project_id: str, provider_name: str | None = None
 ) -> ProjectIntelligence:
