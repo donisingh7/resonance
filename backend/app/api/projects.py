@@ -12,6 +12,11 @@ def create_project(payload: ProjectCreateRequest):
     return storage.create_project(payload.name, payload.description)
 
 
+@router.get("", response_model=list[Project])
+def list_projects():
+    return storage.list_projects()
+
+
 @router.get("/{project_id}", response_model=Project)
 def get_project(project_id: str):
     try:

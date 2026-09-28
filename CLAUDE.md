@@ -31,7 +31,10 @@ compatible licensing.
     `questionnaire.py` (Questionnaire, Question, QuestionType — the S5
     follow-up questionnaire derived from a ProjectIntelligence), `report.py`
     (ExecutiveReport, RiskFlag, RiskSeverity, QuestionnaireSummary — the S5
-    management-readable report, reusing `EvidenceItem` from `intelligence.py`)
+    management-readable report, reusing `EvidenceItem` from `intelligence.py`),
+    `overview.py` (ProjectOverview, StageStatus — the S6 read-only pipeline
+    snapshot for one project), `workflow.py` (WorkflowRunResult — the S6
+    orchestration run outcome, reusing `ProjectOverview`)
   - `services/` — business logic / persistence:
     - `storage.py` — file-based persistence only (projects, assets,
       processing results, project intelligence, questionnaires, reports on
@@ -76,6 +79,26 @@ compatible licensing.
       in a `Paragraph`, since reportlab's Paragraph markup is a small XML
       dialect that would otherwise raise on real content containing
       `&`/`<`/`>`.
+    - `overview.py` — the pipeline-state aggregation service (S6). Reads
+      only already-persisted data (assets, processing results, intelligence,
+      questionnaires, reports) and derives a `ProjectOverview`: counts,
+      availability flags, and a deterministic `current_stage` /
+      `overall_pipeline_status` / `next_recommended_action` cascade. No
+      progress percentage is ever computed — status is always a discrete
+      stage derived from what exists. Also exposes
+      `intelligence_is_outdated()`, shared with `workflow.py` to detect when
+      new processing results exist that the current intelligence doesn't
+      cover yet.
+    - `workflow.py` — the synchronous orchestration service (S6). Calls
+      `processing.process_asset()` for every asset with no processing
+      attempt yet, then `intelligence.generate_project_intelligence()` only
+      if missing/failed/outdated, then `questionnaire.generate_questionnaire()`
+      only if none exists yet for the current intelligence (never
+      regenerates an existing one — that would silently discard manual
+      edits), then `report.generate_report()` only if none exists yet for
+      the current (intelligence, questionnaire) pairing. Pure composition
+      of existing services — no new processing/synthesis logic, no queues,
+      no background workers; it's one synchronous function call per run.
     - `video_tools.py` — thin ffmpeg/ffprobe subprocess wrappers (probe
       duration, extract audio, extract keyframes). No AI, no persistence.
     - `ai_providers/` — provider abstraction: `base.py` (the `AIProvider`
@@ -89,6 +112,14 @@ compatible licensing.
       provider.
 - **Frontend**: Streamlit, single `frontend/app.py` for now. Talks to backend
   only via HTTP (`BACKEND_URL` env var), no direct imports from `backend/`.
+  Since S6, structured as a project picker (create/select/open-by-id, backed
+  by `GET /projects`) followed by six tabs for the active project (Overview,
+  Assets, Intelligence, Questionnaire, Executive Report, Evidence). All
+  backend calls go through `api_get`/`api_post`/`api_put` helpers that
+  return `None` on a connection failure so every call site can render a
+  user-facing message via `show_backend_error()` instead of a raw
+  stack trace — keep using these helpers for new frontend code rather than
+  calling `requests` directly.
 - **Persistence**: lightweight file-based, under `data/projects/{project_id}/`.
   No database yet. Each project has `project.json`, an `uploads/` subdirectory
   (raw stored files), an `assets/` subdirectory (one `{asset_id}.json` per
@@ -132,6 +163,16 @@ compatible licensing.
   reformats already-generated intelligence/questionnaire content).
   Regenerating a report for the same intelligence result overwrites the
   previous one (and its PDF file) rather than accumulating duplicates.
+- **Workflow runs (S6) are idempotent by construction, not by id**: there is
+  no `WorkflowRunResult` persistence — each run is a live composition of
+  the same idempotent per-resource operations above (`process_asset`,
+  `generate_project_intelligence`, `generate_questionnaire`,
+  `generate_report`), each of which already no-ops or overwrites-in-place
+  rather than duplicating. `workflow.py` additionally *skips* calling
+  `generate_questionnaire`/`generate_report` at all once a current one
+  exists (rather than relying solely on their own overwrite behavior),
+  specifically so a second "Run Remaining Pipeline" click can never
+  silently discard a manually edited questionnaire.
 - Routers are included in `backend/app/main.py`; keep new endpoints as new
   router modules under `api/`, not inline in `main.py`.
 - Never return absolute, machine-specific filesystem paths in API responses —
@@ -188,6 +229,16 @@ compatible licensing.
   **not** a content-moderation or safety classifier. Do not add a keyword-
   based "safety" rule without labeling exactly how conservative/limited it
   is; none is implemented as of S5.
+- Orchestration (S6, `workflow.py`) is a plain synchronous function that
+  composes existing per-resource services — it must never contain its own
+  processing/synthesis logic, and must never be turned into a queue,
+  background worker, or async task system until explicitly scoped. If a
+  new pipeline step is added later, wire it into `workflow.py`'s sequence
+  and `overview.py`'s stage cascade together, so the "what's next" status
+  and the "do what's next" action never drift apart.
+- Pipeline status (S6, `overview.py`) is always a discrete, deterministically
+  derived stage (`StageStatus`) — never a fabricated progress percentage or
+  a value not directly traceable to persisted data.
 - No authentication, Docker, queues, or cloud deployment until explicitly
   scoped.
 - Validate inputs at API boundaries (e.g. file extension allowlist for
@@ -220,9 +271,20 @@ compatible licensing.
    any) into management-readable sections with deterministic risk/
    data-quality flags and, when `reportlab` is available, a downloadable
    PDF. Still mock-only — see `docs/BUILD_STATUS.md` for exact scope.
-5. Final recruiter-grade UI redesign, database migration, authentication,
-   cloud deployment, embeddings/vector DB, RAG, real external provider
-   credentials, final evaluation benchmark — not started, deliberately
-   deferred from S5
+5. ~~Recruiter-ready end-to-end dashboard + workflow orchestration~~ —
+   **done, mock-only** (S6/R5): a `ProjectOverview` aggregates real pipeline
+   state (asset/processing counts, intelligence/questionnaire/report
+   availability) into a deterministic stage and next-action; a synchronous
+   `workflow.run` endpoint executes whichever pipeline steps are missing in
+   one call, safely skipping steps that already exist (preserving manual
+   questionnaire edits); a per-asset retry endpoint reuses `process_asset`
+   unchanged; Streamlit was reorganized into a project picker + six tabs
+   (Overview, Assets, Intelligence, Questionnaire, Executive Report,
+   Evidence) as one coherent guided flow instead of disconnected controls.
+   Still mock-only — see `docs/BUILD_STATUS.md` for exact scope.
+6. Database migration, authentication, cloud deployment, embeddings/vector
+   DB, RAG, real external provider credentials, final evaluation benchmark,
+   large automated test suite, comprehensive security hardening — not
+   started, deliberately deferred from S6
 
 Do not start a phase early — follow explicit instructions per step.

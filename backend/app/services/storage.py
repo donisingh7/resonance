@@ -140,6 +140,19 @@ def get_project(project_id: str) -> Project:
     return Project.model_validate_json(project_file.read_text(encoding="utf-8"))
 
 
+def list_projects() -> list[Project]:
+    data_root = _data_root()
+    if not data_root.exists():
+        return []
+
+    projects = []
+    for project_dir in sorted(data_root.iterdir()):
+        project_file = project_dir / "project.json"
+        if project_file.exists():
+            projects.append(Project.model_validate_json(project_file.read_text(encoding="utf-8")))
+    return sorted(projects, key=lambda project: project.created_at)
+
+
 def safe_stored_filename(original_filename: str, extension: str) -> str:
     stem = Path(original_filename).stem
     safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_") or "file"
