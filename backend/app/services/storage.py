@@ -41,6 +41,41 @@ class UnsupportedFileTypeError(Exception):
     pass
 
 
+class EmptyFileError(Exception):
+    pass
+
+
+# Every project/asset/processing-result/intelligence/questionnaire/report id
+# in this codebase is either a uuid4 or a uuid5 hex string, so this pattern
+# comfortably covers all legitimate ids while rejecting anything containing
+# "/", "\", "..", or other characters that could influence path resolution.
+_SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _validate_id(value: str, not_found_exc: type[Exception]) -> str:
+    """Guards every path built from a caller-supplied id against path
+    traversal / arbitrary filesystem access. An invalid id is treated
+    identically to a nonexistent one (same exception, same eventual 404) —
+    a client can't distinguish "malformed id" from "id not found", which
+    avoids leaking anything about *why* a request was rejected."""
+    if not _SAFE_ID_PATTERN.match(value):
+        raise not_found_exc(value)
+    return value
+
+
+def redact_absolute_paths(text: str) -> str:
+    """Strips this machine's absolute repo path out of an error message
+    before it is persisted or returned via the API. Some parsing libraries
+    (Pillow, pypdf, mutagen, hachoir) embed the absolute file path in their
+    exception text; without this, that path — including the local
+    Windows username/directory layout — would leak into a persisted
+    ProcessingResult/Questionnaire/ExecutiveReport `error` field and from
+    there into an ordinary API response."""
+    root = str(project_root())
+    redacted = text.replace(root, "<project-root>")
+    return redacted.replace(root.replace("\\", "/"), "<project-root>")
+
+
 def project_root() -> Path:
     return Path(settings.data_dir).parent
 
@@ -50,6 +85,7 @@ def _data_root() -> Path:
 
 
 def _project_dir(project_id: str) -> Path:
+    _validate_id(project_id, ProjectNotFoundError)
     return _data_root() / project_id
 
 
@@ -66,6 +102,7 @@ def _assets_dir(project_id: str) -> Path:
 
 
 def _asset_file(project_id: str, asset_id: str) -> Path:
+    _validate_id(asset_id, AssetNotFoundError)
     return _assets_dir(project_id) / f"{asset_id}.json"
 
 
@@ -74,6 +111,7 @@ def _processing_results_dir(project_id: str) -> Path:
 
 
 def _processing_result_file(project_id: str, result_id: str) -> Path:
+    _validate_id(result_id, ProcessingResultNotFoundError)
     return _processing_results_dir(project_id) / f"{result_id}.json"
 
 
@@ -82,6 +120,7 @@ def _intelligence_dir(project_id: str) -> Path:
 
 
 def _intelligence_file(project_id: str, intelligence_id: str) -> Path:
+    _validate_id(intelligence_id, ProjectIntelligenceNotFoundError)
     return _intelligence_dir(project_id) / f"{intelligence_id}.json"
 
 
@@ -90,6 +129,7 @@ def _questionnaires_dir(project_id: str) -> Path:
 
 
 def _questionnaire_file(project_id: str, questionnaire_id: str) -> Path:
+    _validate_id(questionnaire_id, QuestionnaireNotFoundError)
     return _questionnaires_dir(project_id) / f"{questionnaire_id}.json"
 
 
@@ -98,10 +138,12 @@ def _reports_dir(project_id: str) -> Path:
 
 
 def _report_file(project_id: str, report_id: str) -> Path:
+    _validate_id(report_id, ReportNotFoundError)
     return _reports_dir(project_id) / f"{report_id}.json"
 
 
 def report_pdf_path(project_id: str, report_id: str) -> Path:
+    _validate_id(report_id, ReportNotFoundError)
     return _reports_dir(project_id) / f"{report_id}.pdf"
 
 

@@ -1,6 +1,7 @@
 import uuid
 from typing import Any
 
+from app.core.observability import track_operation
 from app.models.intelligence import EvidenceItem, IntelligenceStatus, ProjectIntelligence
 from app.models.processing import ProcessingResult, ProcessingStatus
 from app.services import storage
@@ -63,93 +64,102 @@ def generate_project_intelligence(
     provider = get_ai_provider(provider_name)
     intelligence_id = _deterministic_intelligence_id(project_id, provider.name)
 
-    all_results = storage.list_processing_results(project_id)
-    assets_by_id = {asset.id: asset for asset in storage.list_assets(project_id)}
+    with track_operation(
+        "generate_project_intelligence", project_id=project_id, provider=provider.name
+    ) as op:
+        all_results = storage.list_processing_results(project_id)
+        assets_by_id = {asset.id: asset for asset in storage.list_assets(project_id)}
 
-    completed_results = [r for r in all_results if r.status == ProcessingStatus.completed]
-    failed_results = [r for r in all_results if r.status == ProcessingStatus.failed]
-    considered_results = completed_results[:MAX_ASSETS_IN_CONTEXT]
+        completed_results = [r for r in all_results if r.status == ProcessingStatus.completed]
+        failed_results = [r for r in all_results if r.status == ProcessingStatus.failed]
+        considered_results = completed_results[:MAX_ASSETS_IN_CONTEXT]
 
-    contexts: list[ProjectAssetContext] = []
-    empty_content_result_ids: list[str] = []
-    for result in considered_results:
-        text = _extract_result_text(result)
-        if not text:
-            empty_content_result_ids.append(result.id)
-            continue
-        asset = assets_by_id.get(result.asset_id)
-        contexts.append(
-            {
-                "asset_id": result.asset_id,
-                "processing_result_id": result.id,
-                "source_filename": asset.original_filename if asset else result.asset_id,
-                "modality": result.modality.value,
-                "text": text[:MAX_CHARS_PER_ASSET],
-            }
-        )
+        contexts: list[ProjectAssetContext] = []
+        empty_content_result_ids: list[str] = []
+        for result in considered_results:
+            text = _extract_result_text(result)
+            if not text:
+                empty_content_result_ids.append(result.id)
+                continue
+            asset = assets_by_id.get(result.asset_id)
+            contexts.append(
+                {
+                    "asset_id": result.asset_id,
+                    "processing_result_id": result.id,
+                    "source_filename": asset.original_filename if asset else result.asset_id,
+                    "modality": result.modality.value,
+                    "text": text[:MAX_CHARS_PER_ASSET],
+                }
+            )
 
-    base_metadata: dict[str, Any] = {
-        "total_processing_results": len(all_results),
-        "completed_results": len(completed_results),
-        "failed_result_ids": [r.id for r in failed_results],
-        "empty_content_result_ids": empty_content_result_ids,
-        "assets_in_context": len(contexts),
-        "asset_context_capped": len(completed_results) > MAX_ASSETS_IN_CONTEXT,
-    }
+        base_metadata: dict[str, Any] = {
+            "total_processing_results": len(all_results),
+            "completed_results": len(completed_results),
+            "failed_result_ids": [r.id for r in failed_results],
+            "empty_content_result_ids": empty_content_result_ids,
+            "assets_in_context": len(contexts),
+            "asset_context_capped": len(completed_results) > MAX_ASSETS_IN_CONTEXT,
+        }
+        op["source_result_count"] = len(contexts)
 
-    if not contexts:
-        result = ProjectIntelligence(
-            id=intelligence_id,
-            project_id=project_id,
-            status=IntelligenceStatus.completed,
-            provider=provider.name,
-            source_result_ids=[],
-            summary=(
-                "No processed asset content is available for this project yet. "
-                "Process at least one asset (with extracted text, transcript, or "
-                "visual description) before generating project intelligence."
-            ),
-            processing_metadata=base_metadata,
-        )
-        storage.save_project_intelligence(result)
-        return result
+        if not contexts:
+            result = ProjectIntelligence(
+                id=intelligence_id,
+                project_id=project_id,
+                status=IntelligenceStatus.completed,
+                provider=provider.name,
+                source_result_ids=[],
+                summary=(
+                    "No processed asset content is available for this project yet. "
+                    "Process at least one asset (with extracted text, transcript, or "
+                    "visual description) before generating project intelligence."
+                ),
+                processing_metadata=base_metadata,
+            )
+            storage.save_project_intelligence(result)
+            op["status"] = result.status.value
+            op["evidence_count"] = 0
+            return result
 
-    try:
-        synthesis = provider.synthesize_project(contexts)
-        valid_result_ids = {c["processing_result_id"] for c in contexts}
-        evidence_items = [
-            EvidenceItem(**item)
-            for item in synthesis["evidence"]
-            if item["processing_result_id"] in valid_result_ids
-        ]
+        try:
+            synthesis = provider.synthesize_project(contexts)
+            valid_result_ids = {c["processing_result_id"] for c in contexts}
+            evidence_items = [
+                EvidenceItem(**item)
+                for item in synthesis["evidence"]
+                if item["processing_result_id"] in valid_result_ids
+            ]
 
-        result = ProjectIntelligence(
-            id=intelligence_id,
-            project_id=project_id,
-            status=IntelligenceStatus.completed,
-            provider=provider.name,
-            source_result_ids=[c["processing_result_id"] for c in contexts],
-            summary=synthesis["summary"],
-            top_themes=synthesis["top_themes"],
-            sentiment_summary=synthesis["sentiment_summary"],
-            pain_points=synthesis["pain_points"],
-            positive_signals=synthesis["positive_signals"],
-            questions_or_concerns=synthesis["questions_or_concerns"],
-            opportunities=synthesis["opportunities"],
-            recommended_actions=synthesis["recommended_actions"],
-            evidence=evidence_items,
-            processing_metadata={**base_metadata, **synthesis["metadata"]},
-        )
-    except Exception as exc:
-        result = ProjectIntelligence(
-            id=intelligence_id,
-            project_id=project_id,
-            status=IntelligenceStatus.failed,
-            provider=provider.name,
-            source_result_ids=[c["processing_result_id"] for c in contexts],
-            processing_metadata=base_metadata,
-            error=str(exc),
-        )
+            result = ProjectIntelligence(
+                id=intelligence_id,
+                project_id=project_id,
+                status=IntelligenceStatus.completed,
+                provider=provider.name,
+                source_result_ids=[c["processing_result_id"] for c in contexts],
+                summary=synthesis["summary"],
+                top_themes=synthesis["top_themes"],
+                sentiment_summary=synthesis["sentiment_summary"],
+                pain_points=synthesis["pain_points"],
+                positive_signals=synthesis["positive_signals"],
+                questions_or_concerns=synthesis["questions_or_concerns"],
+                opportunities=synthesis["opportunities"],
+                recommended_actions=synthesis["recommended_actions"],
+                evidence=evidence_items,
+                processing_metadata={**base_metadata, **synthesis["metadata"]},
+            )
+        except Exception as exc:
+            result = ProjectIntelligence(
+                id=intelligence_id,
+                project_id=project_id,
+                status=IntelligenceStatus.failed,
+                provider=provider.name,
+                source_result_ids=[c["processing_result_id"] for c in contexts],
+                processing_metadata=base_metadata,
+                error=storage.redact_absolute_paths(str(exc)),
+            )
+
+        op["status"] = result.status.value
+        op["evidence_count"] = len(result.evidence)
 
     storage.save_project_intelligence(result)
     return result

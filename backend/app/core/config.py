@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     # value; set it in a local .env only.
     ai_api_key: str | None = None
 
+    # Upload size guardrail, enforced at the API boundary in api/projects.py.
+    # 25 MB is a reasonable local-development default for TXT/PDF/image/
+    # short audio-video fixtures; raise it in .env for larger real files.
+    max_upload_size_mb: int = 25
+
     class Config:
         env_file = ".env"
 

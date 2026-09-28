@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from app.core.observability import track_operation
 from app.models.asset import Asset, Modality
 from app.models.processing import ProcessingResult, ProcessingStatus
 from app.services import storage, video_tools
@@ -149,47 +150,55 @@ def process_asset(project_id: str, asset_id: str) -> ProcessingResult:
     result_id = _deterministic_result_id(asset.id, provider.name)
     absolute_path = storage.project_root() / asset.stored_path
 
-    start = time.monotonic()
-    try:
-        if asset.modality == Modality.document:
-            result_fields, modality_metadata = _process_document(asset, absolute_path)
-        elif asset.modality == Modality.image:
-            result_fields, modality_metadata = _process_image(absolute_path, provider)
-        elif asset.modality == Modality.audio:
-            result_fields, modality_metadata = _process_audio(absolute_path, provider)
-        elif asset.modality == Modality.video:
-            result_fields, modality_metadata = _process_video(asset, absolute_path, provider)
-        else:
-            raise ValueError(f"Unsupported modality: {asset.modality}")
+    with track_operation(
+        "process_asset",
+        project_id=project_id,
+        asset_id=asset_id,
+        modality=asset.modality.value,
+        provider=provider.name,
+    ) as op:
+        start = time.monotonic()
+        try:
+            if asset.modality == Modality.document:
+                result_fields, modality_metadata = _process_document(asset, absolute_path)
+            elif asset.modality == Modality.image:
+                result_fields, modality_metadata = _process_image(absolute_path, provider)
+            elif asset.modality == Modality.audio:
+                result_fields, modality_metadata = _process_audio(absolute_path, provider)
+            elif asset.modality == Modality.video:
+                result_fields, modality_metadata = _process_video(asset, absolute_path, provider)
+            else:
+                raise ValueError(f"Unsupported modality: {asset.modality}")
 
-        result = ProcessingResult(
-            id=result_id,
-            project_id=project_id,
-            asset_id=asset.id,
-            modality=asset.modality,
-            status=ProcessingStatus.completed,
-            provider=provider.name,
-            modality_metadata=modality_metadata,
-            processing_metadata={
-                "provider": provider.name,
-                "duration_ms": int((time.monotonic() - start) * 1000),
-            },
-            **result_fields,
-        )
-    except Exception as exc:
-        result = ProcessingResult(
-            id=result_id,
-            project_id=project_id,
-            asset_id=asset.id,
-            modality=asset.modality,
-            status=ProcessingStatus.failed,
-            provider=provider.name,
-            processing_metadata={
-                "provider": provider.name,
-                "duration_ms": int((time.monotonic() - start) * 1000),
-            },
-            error=str(exc),
-        )
+            result = ProcessingResult(
+                id=result_id,
+                project_id=project_id,
+                asset_id=asset.id,
+                modality=asset.modality,
+                status=ProcessingStatus.completed,
+                provider=provider.name,
+                modality_metadata=modality_metadata,
+                processing_metadata={
+                    "provider": provider.name,
+                    "duration_ms": int((time.monotonic() - start) * 1000),
+                },
+                **result_fields,
+            )
+        except Exception as exc:
+            result = ProcessingResult(
+                id=result_id,
+                project_id=project_id,
+                asset_id=asset.id,
+                modality=asset.modality,
+                status=ProcessingStatus.failed,
+                provider=provider.name,
+                processing_metadata={
+                    "provider": provider.name,
+                    "duration_ms": int((time.monotonic() - start) * 1000),
+                },
+                error=storage.redact_absolute_paths(str(exc)),
+            )
+        op["status"] = result.status.value
 
     storage.save_processing_result(result)
     return result

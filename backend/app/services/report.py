@@ -1,6 +1,7 @@
 import uuid
 from typing import Any
 
+from app.core.observability import track_operation
 from app.models.intelligence import ProjectIntelligence
 from app.models.project import Project
 from app.models.questionnaire import Questionnaire
@@ -221,55 +222,84 @@ def generate_report(
     verbatim from the source ProjectIntelligence — nothing is regenerated
     or reinterpreted, so evidence traceability is preserved automatically.
     PDF rendering is attempted but isolated: a rendering failure is
-    recorded as a risk flag rather than failing the whole report.
+    recorded as a risk flag rather than failing the whole report. Any
+    other unexpected failure while building the report is caught and
+    turned into a status="failed" ExecutiveReport instead of propagating
+    as an unhandled 500, mirroring processing.py/intelligence.py/
+    questionnaire.py.
     """
     project = storage.get_project(project_id)
     target_intelligence = intelligence_service.resolve_intelligence(project_id, intelligence_id)
     target_questionnaire = _resolve_questionnaire(project_id, target_intelligence.id, questionnaire_id)
+    report_id = _deterministic_report_id(target_intelligence.id)
 
-    coverage = _build_source_coverage(project_id, target_intelligence)
-
-    questionnaire_summary = None
-    if target_questionnaire:
-        questionnaire_summary = QuestionnaireSummary(
-            questionnaire_id=target_questionnaire.id,
-            question_count=len(target_questionnaire.questions),
-            status=target_questionnaire.status.value,
-        )
-
-    report = ExecutiveReport(
-        id=_deterministic_report_id(target_intelligence.id),
+    with track_operation(
+        "generate_report",
         project_id=project_id,
         intelligence_id=target_intelligence.id,
-        questionnaire_id=target_questionnaire.id if target_questionnaire else None,
-        status=ReportStatus.completed,
         provider=target_intelligence.provider,
-        executive_summary=_build_executive_summary(project, target_intelligence, coverage),
-        source_coverage=coverage,
-        overall_sentiment=target_intelligence.sentiment_summary,
-        top_themes=target_intelligence.top_themes,
-        pain_points=target_intelligence.pain_points,
-        positive_signals=target_intelligence.positive_signals,
-        questions_or_concerns=target_intelligence.questions_or_concerns,
-        opportunities=target_intelligence.opportunities,
-        recommended_actions=target_intelligence.recommended_actions,
-        evidence=target_intelligence.evidence,
-        questionnaire_summary=questionnaire_summary,
-        risk_flags=_build_risk_flags(target_intelligence, target_questionnaire, coverage),
-    )
+    ) as op:
+        try:
+            coverage = _build_source_coverage(project_id, target_intelligence)
 
-    try:
-        pdf_absolute_path = storage.report_pdf_path(project_id, report.id)
-        render_report_pdf(report, project, pdf_absolute_path)
-        report.pdf_path = str(pdf_absolute_path.relative_to(storage.project_root()))
-    except Exception as exc:
-        report.risk_flags.append(
-            RiskFlag(
-                code="pdf_generation_failed",
-                severity=RiskSeverity.warning,
-                message=f"PDF rendering failed for this report: {exc}",
+            questionnaire_summary = None
+            if target_questionnaire:
+                questionnaire_summary = QuestionnaireSummary(
+                    questionnaire_id=target_questionnaire.id,
+                    question_count=len(target_questionnaire.questions),
+                    status=target_questionnaire.status.value,
+                )
+
+            report = ExecutiveReport(
+                id=report_id,
+                project_id=project_id,
+                intelligence_id=target_intelligence.id,
+                questionnaire_id=target_questionnaire.id if target_questionnaire else None,
+                status=ReportStatus.completed,
+                provider=target_intelligence.provider,
+                executive_summary=_build_executive_summary(project, target_intelligence, coverage),
+                source_coverage=coverage,
+                overall_sentiment=target_intelligence.sentiment_summary,
+                top_themes=target_intelligence.top_themes,
+                pain_points=target_intelligence.pain_points,
+                positive_signals=target_intelligence.positive_signals,
+                questions_or_concerns=target_intelligence.questions_or_concerns,
+                opportunities=target_intelligence.opportunities,
+                recommended_actions=target_intelligence.recommended_actions,
+                evidence=target_intelligence.evidence,
+                questionnaire_summary=questionnaire_summary,
+                risk_flags=_build_risk_flags(target_intelligence, target_questionnaire, coverage),
             )
-        )
+
+            try:
+                pdf_absolute_path = storage.report_pdf_path(project_id, report.id)
+                render_report_pdf(report, project, pdf_absolute_path)
+                report.pdf_path = str(pdf_absolute_path.relative_to(storage.project_root()))
+            except Exception as exc:
+                report.risk_flags.append(
+                    RiskFlag(
+                        code="pdf_generation_failed",
+                        severity=RiskSeverity.warning,
+                        message=(
+                            f"PDF rendering failed for this report: "
+                            f"{storage.redact_absolute_paths(str(exc))}"
+                        ),
+                    )
+                )
+        except Exception as exc:
+            report = ExecutiveReport(
+                id=report_id,
+                project_id=project_id,
+                intelligence_id=target_intelligence.id,
+                questionnaire_id=target_questionnaire.id if target_questionnaire else None,
+                status=ReportStatus.failed,
+                provider=target_intelligence.provider,
+                error=storage.redact_absolute_paths(str(exc)),
+            )
+
+        op["status"] = report.status.value
+        op["evidence_count"] = len(report.evidence)
+        op["source_result_count"] = len(target_intelligence.source_result_ids)
 
     storage.save_report(report)
     return report

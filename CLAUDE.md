@@ -21,8 +21,9 @@ compatible licensing.
 ## Architecture conventions
 
 - **Backend**: FastAPI, modular under `backend/app/`:
-  - `api/` — route modules (one file per resource: `health.py`, `projects.py`, `assets.py`)
-  - `core/` — settings/config (`config.py`, pydantic-settings, reads `.env`)
+  - `api/` — route modules (one file per resource: `health.py`, `readiness.py`, `projects.py`, `assets.py`)
+  - `core/` — settings/config (`config.py`, pydantic-settings, reads `.env`) and
+    `observability.py` (S7 — structured operation logging, see below)
   - `models/` — pydantic models (data shapes, not ORM — no DB yet): `project.py` (Project),
     `asset.py` (Asset, Modality, IngestionStatus, MODALITY_BY_EXTENSION — the single
     source of truth for which extensions are supported and their modality),
@@ -34,11 +35,24 @@ compatible licensing.
     management-readable report, reusing `EvidenceItem` from `intelligence.py`),
     `overview.py` (ProjectOverview, StageStatus — the S6 read-only pipeline
     snapshot for one project), `workflow.py` (WorkflowRunResult — the S6
-    orchestration run outcome, reusing `ProjectOverview`)
+    orchestration run outcome, reusing `ProjectOverview`), `readiness.py`
+    (ReadinessReport, ReadinessCheck — the S7 capability/readiness snapshot),
+    `evidence_integrity.py` (EvidenceIntegrityReport, EvidenceIntegrityIssue
+    — the S7 evidence-reference validator's typed result)
   - `services/` — business logic / persistence:
     - `storage.py` — file-based persistence only (projects, assets,
       processing results, project intelligence, questionnaires, reports on
-      disk). Owns the on-disk layout; no metadata extraction or AI logic here.
+      disk). Owns the on-disk layout; no metadata extraction or AI logic
+      here. **Every caller-supplied id (`project_id`, `asset_id`,
+      `result_id`, `intelligence_id`, `questionnaire_id`, `report_id`) is
+      validated against a strict `^[A-Za-z0-9_-]{1,128}$` pattern before
+      being used to build a filesystem path** (S7 hardening) — an invalid
+      id raises the same NotFound exception as a missing one, so a client
+      can't distinguish "malformed" from "doesn't exist" and path
+      traversal via a crafted id is structurally impossible. Also owns
+      `redact_absolute_paths()`, used everywhere an exception's `str(exc)`
+      is persisted into an `error` field or risk-flag message, since some
+      parsing libraries embed the absolute file path in their error text.
     - `ingestion.py` — the normalization/ingestion service. Turns raw upload
       bytes into an `Asset` (hashing, MIME guess, per-modality technical
       metadata extraction, no AI). Keep future modality-specific extraction
@@ -109,7 +123,39 @@ compatible licensing.
       via `settings.ai_provider`). Add a real provider as a new module here
       and register it in the factory; don't touch `processing.py`'s,
       `intelligence.py`'s, or `questionnaire.py`'s dispatch logic to add a
-      provider.
+      provider. Every metadata dict returned here includes a `token_usage`
+      key, explicitly `None` for `MockAIProvider` (it makes no real model
+      call) — a future real provider should populate the same key rather
+      than inventing a number or omitting it.
+    - `readiness.py` — the capability/readiness service (S7). Runs a small,
+      fixed set of local checks (data directory writable, configured AI
+      provider resolves, ffmpeg/hachoir importable) and reports them as a
+      structured `ReadinessReport`. Only `required` checks affect the
+      overall `ready` flag — an unavailable *optional* modality dependency
+      (ffmpeg, hachoir) is surfaced for visibility but never marks the
+      whole app unready, since every other modality/feature keeps working.
+    - `evidence_integrity.py` — the evidence-reference validator (S7).
+      Checks that every `EvidenceItem` on a `ProjectIntelligence` really
+      references a real `asset_id`, a real `processing_result_id` that
+      belongs to that asset, and that asset's own filename. Reports
+      mismatches; never repairs or invents a replacement. Used by
+      `scripts/evaluate.py` and `backend/tests/test_critical.py` — this is
+      the S4 evidence architecture's own integrity check, not a redesign
+      of it.
+- **Observability** (S7, `core/observability.py`): `track_operation(name,
+  **fields)` is a context manager wrapped around every top-level service
+  entrypoint that does real work (`process_asset`,
+  `generate_project_intelligence`, `generate_questionnaire`,
+  `generate_report`, `run_workflow`) — it emits one structured JSON log
+  line per call with a short correlation id, the passed fields
+  (`project_id`, `asset_id`, `provider`, etc.), `status`, `duration_ms`,
+  and — on an uncaught exception — `error_type`/`error_message`, then
+  re-raises unchanged. A separate HTTP middleware in `main.py` does the
+  same per-request (method, path, status code, duration) and echoes the
+  correlation id back via an `X-Request-ID` response header. **Never log
+  file contents, extracted text, transcripts, evidence excerpts, secrets,
+  or API keys** — only identifiers, status, timing, and short error
+  summaries; keep new instrumentation to that same discipline.
 - **Frontend**: Streamlit, single `frontend/app.py` for now. Talks to backend
   only via HTTP (`BACKEND_URL` env var), no direct imports from `backend/`.
   Since S6, structured as a project picker (create/select/open-by-id, backed
@@ -195,7 +241,14 @@ compatible licensing.
 - PDF rendering (S5): `reportlab` (platypus), pure-Python, no system
   dependency. Used only to render an already-built `ExecutiveReport` to
   PDF — it has no role in generating report content.
-- No auth, no cloud deployment yet
+- Testing/evaluation (S7): `pytest` + `httpx` (for FastAPI's
+  `TestClient`) — both installed into `.venv` only, added to
+  `requirements.txt`. `backend/tests/` is the regression suite;
+  `scripts/evaluate.py` is the standalone evaluation harness, both driven
+  through `TestClient` (in-process, no server/port needed) against a
+  throwaway `data_dir` so neither ever touches real project data.
+- No auth, no cloud deployment yet — see `docs/DEPLOYMENT.md` for what's
+  documented-but-not-done to prepare for that.
 
 ## Coding rules
 
@@ -241,10 +294,28 @@ compatible licensing.
   a value not directly traceable to persisted data.
 - No authentication, Docker, queues, or cloud deployment until explicitly
   scoped.
-- Validate inputs at API boundaries (e.g. file extension allowlist for
-  uploads); trust internal service code otherwise.
-- Avoid heavy automated test suites at this stage — smoke-test manually per
-  phase instructions instead, unless a phase explicitly asks for tests.
+- Validate inputs at API boundaries: file extension allowlist, upload size
+  (`settings.max_upload_size_mb`, enforced in `api/projects.py`, `413` if
+  exceeded), rejected zero-byte uploads (`400`), and every caller-supplied
+  id validated against `storage._SAFE_ID_PATTERN` before touching the
+  filesystem (S7). Trust internal service code otherwise.
+- Never let an exception's raw `str(exc)` reach a persisted `error` field
+  or an API response without passing it through
+  `storage.redact_absolute_paths()` first — several parsing libraries
+  (Pillow, pypdf, mutagen, hachoir) embed the absolute file path in their
+  error text, which would otherwise leak local machine/filesystem layout.
+- The regression suite in `backend/tests/` (pytest) covers only the
+  highest-risk contracts explicitly scoped in S7 (upload validation, path
+  safety, project isolation, failure isolation, idempotency, evidence
+  integrity, questionnaire-edit preservation, report/PDF generation,
+  overview stage behavior) — it is deliberately small. Do not chase a
+  coverage percentage; add a test here only for a comparably high-risk
+  contract, not for its own sake.
+- `scripts/evaluate.py` is an **engineering/pipeline** evaluation harness,
+  not an AI-quality benchmark — it must never claim or imply a semantic-
+  accuracy/quality result for `MockAIProvider` output. Keep its
+  "Category A: measured" vs. "Category B: not yet measured" separation
+  whenever it's extended.
 - Update `docs/BUILD_STATUS.md` whenever implemented functionality changes,
   and keep it honest — never document features that aren't actually built.
 
@@ -282,9 +353,29 @@ compatible licensing.
    (Overview, Assets, Intelligence, Questionnaire, Executive Report,
    Evidence) as one coherent guided flow instead of disconnected controls.
    Still mock-only — see `docs/BUILD_STATUS.md` for exact scope.
-6. Database migration, authentication, cloud deployment, embeddings/vector
-   DB, RAG, real external provider credentials, final evaluation benchmark,
-   large automated test suite, comprehensive security hardening — not
-   started, deliberately deferred from S6
+6. ~~Hardening + evaluation harness + observability + deployment
+   readiness~~ — **done, mock-only** (S7/R6): path-traversal-safe id
+   validation everywhere a filesystem path is built from a caller-supplied
+   id, configurable upload size limit + zero-byte rejection, absolute-path
+   redaction in every persisted error message, a full-body failure-
+   isolation wrap added to `report.py` (the one remaining gap vs.
+   `processing.py`/`intelligence.py`/`questionnaire.py`'s existing
+   pattern), structured per-operation + per-HTTP-request logging
+   (`core/observability.py`), a `token_usage: null` convention on every
+   `MockAIProvider` metadata dict, a `GET /ready` capability/readiness
+   endpoint, a reusable `evidence_integrity` checker, a small pytest
+   regression suite (`backend/tests/`), a reproducible engineering-only
+   evaluation harness (`scripts/evaluate.py` + `evaluation/`), a repo
+   hygiene pass, `docs/DEPLOYMENT.md`, a recruiter-quality `README.md`, and
+   a minimal test-only CI workflow. No new product features — see
+   `docs/BUILD_STATUS.md` for exact scope. **This was the final planned
+   main development phase** — see `docs/BUILD_STATUS.md` for what remains
+   for an actual deployment phase (P1+).
+7. Database migration, authentication, cloud deployment, embeddings/vector
+   DB, RAG, real external provider credentials, final evaluation benchmark
+   against a real provider, large automated test suite beyond the S7
+   critical-path suite, comprehensive security hardening beyond S7's
+   pragmatic pass, Kubernetes/Terraform, elaborate monitoring stack — not
+   started, deliberately deferred from S7 to a later deployment phase (P1+)
 
 Do not start a phase early — follow explicit instructions per step.

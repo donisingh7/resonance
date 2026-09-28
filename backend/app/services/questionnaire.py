@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
+from app.core.observability import track_operation
 from app.models.questionnaire import Question, Questionnaire, QuestionnaireStatus
 from app.services import intelligence as intelligence_service
 from app.services import storage
@@ -46,30 +47,38 @@ def generate_questionnaire(
         "opportunities": target_intelligence.opportunities,
     }
 
-    try:
-        generation = provider.generate_questionnaire(intelligence_context)
-        questions = [Question(id=str(uuid.uuid4()), **q) for q in generation["questions"]]
-        questionnaire = Questionnaire(
-            id=questionnaire_id,
-            project_id=project_id,
-            intelligence_id=target_intelligence.id,
-            provider=provider.name,
-            status=QuestionnaireStatus.completed,
-            created_at=now,
-            updated_at=now,
-            questions=questions,
-        )
-    except Exception as exc:
-        questionnaire = Questionnaire(
-            id=questionnaire_id,
-            project_id=project_id,
-            intelligence_id=target_intelligence.id,
-            provider=provider.name,
-            status=QuestionnaireStatus.failed,
-            created_at=now,
-            updated_at=now,
-            error=str(exc),
-        )
+    with track_operation(
+        "generate_questionnaire",
+        project_id=project_id,
+        intelligence_id=target_intelligence.id,
+        provider=provider.name,
+    ) as op:
+        try:
+            generation = provider.generate_questionnaire(intelligence_context)
+            questions = [Question(id=str(uuid.uuid4()), **q) for q in generation["questions"]]
+            questionnaire = Questionnaire(
+                id=questionnaire_id,
+                project_id=project_id,
+                intelligence_id=target_intelligence.id,
+                provider=provider.name,
+                status=QuestionnaireStatus.completed,
+                created_at=now,
+                updated_at=now,
+                questions=questions,
+            )
+        except Exception as exc:
+            questionnaire = Questionnaire(
+                id=questionnaire_id,
+                project_id=project_id,
+                intelligence_id=target_intelligence.id,
+                provider=provider.name,
+                status=QuestionnaireStatus.failed,
+                created_at=now,
+                updated_at=now,
+                error=storage.redact_absolute_paths(str(exc)),
+            )
+        op["status"] = questionnaire.status.value
+        op["question_count"] = len(questionnaire.questions)
 
     storage.save_questionnaire(questionnaire)
     return questionnaire

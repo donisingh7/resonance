@@ -86,7 +86,16 @@ class MockAIProvider(AIProvider):
         )
         return {
             "transcript": transcript,
-            "metadata": {"mock": True, "source_file": audio_path.name, "size_bytes": size_bytes},
+            "metadata": {
+                "mock": True,
+                "source_file": audio_path.name,
+                "size_bytes": size_bytes,
+                # No real model call was made, so there is no token usage to
+                # report. Explicitly null rather than omitted, so a future
+                # real provider has an established field to populate instead
+                # of this looking like an oversight.
+                "token_usage": None,
+            },
         }
 
     def analyze_image(self, image_path: Path) -> ImageAnalysisResult:
@@ -110,6 +119,7 @@ class MockAIProvider(AIProvider):
                 "width": width,
                 "height": height,
                 "format": image_format,
+                "token_usage": None,
             },
         }
 
@@ -267,6 +277,7 @@ class MockAIProvider(AIProvider):
             "asset_count": len(assets),
             "keyword_heuristic": True,
             "total_input_characters": total_chars,
+            "token_usage": None,
         }
 
         return {
@@ -393,5 +404,5 @@ class MockAIProvider(AIProvider):
 
         return {
             "questions": questions,
-            "metadata": {"mock": True, "question_count": len(questions)},
+            "metadata": {"mock": True, "question_count": len(questions), "token_usage": None},
         }

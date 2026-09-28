@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+from app.core.observability import track_operation
 from app.models.intelligence import IntelligenceStatus
 from app.models.processing import ProcessingStatus
 from app.models.workflow import WorkflowRunResult
@@ -33,122 +34,139 @@ def run_workflow(project_id: str) -> WorkflowRunResult:
     successes: list[str] = []
     failures: list[str] = []
 
-    # 1. Process any asset with no processing attempt yet. Already-completed
-    # (or already-failed) results are left alone — retrying a failure is a
-    # deliberate, separate action (POST .../assets/{id}/retry), not implied
-    # by re-running the whole workflow.
-    stages_attempted.append("process_assets")
-    assets = storage.list_assets(project_id)
-    attempted_asset_ids = {r.asset_id for r in storage.list_processing_results(project_id)}
-    pending_assets = [a for a in assets if a.id not in attempted_asset_ids]
+    with track_operation("run_workflow", project_id=project_id) as op:
+        # 1. Process any asset with no processing attempt yet. Already-completed
+        # (or already-failed) results are left alone — retrying a failure is a
+        # deliberate, separate action (POST .../assets/{id}/retry), not implied
+        # by re-running the whole workflow.
+        stages_attempted.append("process_assets")
+        assets = storage.list_assets(project_id)
+        attempted_asset_ids = {r.asset_id for r in storage.list_processing_results(project_id)}
+        pending_assets = [a for a in assets if a.id not in attempted_asset_ids]
+        op["total_assets"] = len(assets)
 
-    if not pending_assets:
-        stages_skipped.append("process_assets")
-    else:
-        for asset in pending_assets:
-            try:
-                result = processing.process_asset(project_id, asset.id)
-                if result.status == ProcessingStatus.completed:
-                    successes.append(asset.id)
-                else:
+        if not pending_assets:
+            stages_skipped.append("process_assets")
+        else:
+            for asset in pending_assets:
+                try:
+                    result = processing.process_asset(project_id, asset.id)
+                    if result.status == ProcessingStatus.completed:
+                        successes.append(asset.id)
+                    else:
+                        failures.append(asset.id)
+                        warnings.append(
+                            f"Asset '{asset.original_filename}' ({asset.id}) failed processing: {result.error}"
+                        )
+                except Exception as exc:
                     failures.append(asset.id)
                     warnings.append(
-                        f"Asset '{asset.original_filename}' ({asset.id}) failed processing: {result.error}"
+                        f"Asset '{asset.original_filename}' ({asset.id}) raised an unexpected "
+                        f"error during processing: {storage.redact_absolute_paths(str(exc))}"
                     )
-            except Exception as exc:
-                failures.append(asset.id)
-                warnings.append(
-                    f"Asset '{asset.original_filename}' ({asset.id}) raised an unexpected "
-                    f"error during processing: {exc}"
-                )
-        stages_completed.append("process_assets")
+            stages_completed.append("process_assets")
 
-    # 2. Intelligence: (re)generate if missing, failed, or stale relative to
-    # the processing results that now exist.
-    stages_attempted.append("generate_intelligence")
-    intelligence_records = storage.list_project_intelligence(project_id)
-    latest_intelligence = intelligence_records[-1] if intelligence_records else None
-    completed_results = [
-        r for r in storage.list_processing_results(project_id) if r.status == ProcessingStatus.completed
-    ]
+        op["assets_processed"] = len(successes)
+        op["assets_failed"] = len(failures)
+        op["assets_skipped"] = len(assets) - len(pending_assets)
 
-    needs_intelligence = (
-        latest_intelligence is None
-        or latest_intelligence.status == IntelligenceStatus.failed
-        or (
-            latest_intelligence.status == IntelligenceStatus.completed
-            and overview_service.intelligence_is_outdated(latest_intelligence, completed_results)
-        )
-    )
-
-    if needs_intelligence:
-        latest_intelligence = intelligence_service.generate_project_intelligence(project_id)
-        intelligence_action = "generated"
-        stages_completed.append("generate_intelligence")
-    else:
-        intelligence_action = "reused"
-        stages_skipped.append("generate_intelligence")
-
-    intelligence_id = latest_intelligence.id if latest_intelligence else None
-    intelligence_ready = (
-        latest_intelligence is not None and latest_intelligence.status == IntelligenceStatus.completed
-    )
-    if latest_intelligence is not None and not intelligence_ready:
-        warnings.append(f"Project intelligence generation failed: {latest_intelligence.error}")
-
-    # 3. Questionnaire: generate only if none exists yet for this
-    # intelligence. Never regenerate an existing one here — that would
-    # silently discard manual edits. Regenerating is a separate, explicit
-    # user action via the questionnaire UI/endpoint.
-    stages_attempted.append("generate_questionnaire")
-    questionnaire_id: str | None = None
-    questionnaire_action = "skipped"
-    if intelligence_ready:
-        existing_questionnaires = [
-            q for q in storage.list_questionnaires(project_id) if q.intelligence_id == latest_intelligence.id
+        # 2. Intelligence: (re)generate if missing, failed, or stale relative to
+        # the processing results that now exist.
+        stages_attempted.append("generate_intelligence")
+        intelligence_records = storage.list_project_intelligence(project_id)
+        latest_intelligence = intelligence_records[-1] if intelligence_records else None
+        completed_results = [
+            r
+            for r in storage.list_processing_results(project_id)
+            if r.status == ProcessingStatus.completed
         ]
-        if existing_questionnaires:
-            questionnaire_id = existing_questionnaires[-1].id
-            questionnaire_action = "reused"
-            stages_skipped.append("generate_questionnaire")
-        else:
-            generated_questionnaire = questionnaire_service.generate_questionnaire(
-                project_id, latest_intelligence.id
+
+        needs_intelligence = (
+            latest_intelligence is None
+            or latest_intelligence.status == IntelligenceStatus.failed
+            or (
+                latest_intelligence.status == IntelligenceStatus.completed
+                and overview_service.intelligence_is_outdated(latest_intelligence, completed_results)
             )
-            questionnaire_id = generated_questionnaire.id
-            questionnaire_action = "generated"
-            stages_completed.append("generate_questionnaire")
-    else:
-        stages_skipped.append("generate_questionnaire")
+        )
 
-    # 4. Report: generate if none exists yet for this (intelligence,
-    # questionnaire) pairing; regenerate only if the linked questionnaire
-    # changed since the last report (e.g. a questionnaire was generated
-    # after an earlier report ran with none).
-    stages_attempted.append("generate_report")
-    report_id: str | None = None
-    report_action = "skipped"
-    if intelligence_ready:
-        existing_reports = [
-            r for r in storage.list_reports(project_id) if r.intelligence_id == latest_intelligence.id
-        ]
-        current_report = existing_reports[-1] if existing_reports else None
-        report_is_current = current_report is not None and current_report.questionnaire_id == questionnaire_id
-
-        if report_is_current:
-            report_id = current_report.id
-            report_action = "reused"
-            stages_skipped.append("generate_report")
+        if needs_intelligence:
+            latest_intelligence = intelligence_service.generate_project_intelligence(project_id)
+            intelligence_action = "generated"
+            stages_completed.append("generate_intelligence")
         else:
-            generated_report = report_service.generate_report(project_id, latest_intelligence.id)
-            report_id = generated_report.id
-            report_action = "generated" if current_report is None else "updated"
-            stages_completed.append("generate_report")
-    else:
-        stages_skipped.append("generate_report")
+            intelligence_action = "reused"
+            stages_skipped.append("generate_intelligence")
 
-    finished_at = datetime.now(timezone.utc)
-    final_overview = overview_service.build_project_overview(project_id)
+        intelligence_id = latest_intelligence.id if latest_intelligence else None
+        intelligence_ready = (
+            latest_intelligence is not None
+            and latest_intelligence.status == IntelligenceStatus.completed
+        )
+        if latest_intelligence is not None and not intelligence_ready:
+            warnings.append(f"Project intelligence generation failed: {latest_intelligence.error}")
+
+        # 3. Questionnaire: generate only if none exists yet for this
+        # intelligence. Never regenerate an existing one here — that would
+        # silently discard manual edits. Regenerating is a separate, explicit
+        # user action via the questionnaire UI/endpoint.
+        stages_attempted.append("generate_questionnaire")
+        questionnaire_id: str | None = None
+        questionnaire_action = "skipped"
+        if intelligence_ready:
+            existing_questionnaires = [
+                q
+                for q in storage.list_questionnaires(project_id)
+                if q.intelligence_id == latest_intelligence.id
+            ]
+            if existing_questionnaires:
+                questionnaire_id = existing_questionnaires[-1].id
+                questionnaire_action = "reused"
+                stages_skipped.append("generate_questionnaire")
+            else:
+                generated_questionnaire = questionnaire_service.generate_questionnaire(
+                    project_id, latest_intelligence.id
+                )
+                questionnaire_id = generated_questionnaire.id
+                questionnaire_action = "generated"
+                stages_completed.append("generate_questionnaire")
+        else:
+            stages_skipped.append("generate_questionnaire")
+
+        # 4. Report: generate if none exists yet for this (intelligence,
+        # questionnaire) pairing; regenerate only if the linked questionnaire
+        # changed since the last report (e.g. a questionnaire was generated
+        # after an earlier report ran with none).
+        stages_attempted.append("generate_report")
+        report_id: str | None = None
+        report_action = "skipped"
+        if intelligence_ready:
+            existing_reports = [
+                r for r in storage.list_reports(project_id) if r.intelligence_id == latest_intelligence.id
+            ]
+            current_report = existing_reports[-1] if existing_reports else None
+            report_is_current = (
+                current_report is not None and current_report.questionnaire_id == questionnaire_id
+            )
+
+            if report_is_current:
+                report_id = current_report.id
+                report_action = "reused"
+                stages_skipped.append("generate_report")
+            else:
+                generated_report = report_service.generate_report(project_id, latest_intelligence.id)
+                report_id = generated_report.id
+                report_action = "generated" if current_report is None else "updated"
+                stages_completed.append("generate_report")
+        else:
+            stages_skipped.append("generate_report")
+
+        finished_at = datetime.now(timezone.utc)
+        final_overview = overview_service.build_project_overview(project_id)
+
+        op["stages_completed"] = len(stages_completed)
+        op["stages_skipped"] = len(stages_skipped)
+        op["status"] = "completed" if not failures else "partial"
 
     return WorkflowRunResult(
         project_id=project_id,

@@ -110,7 +110,7 @@ def _extract_technical_metadata(
             metadata = {}
         return metadata, IngestionStatus.completed
     except Exception as exc:
-        return {"error": str(exc)}, IngestionStatus.failed
+        return {"error": storage.redact_absolute_paths(str(exc))}, IngestionStatus.failed
 
 
 def ingest_uploaded_file(project_id: str, original_filename: str, content: bytes) -> Asset:

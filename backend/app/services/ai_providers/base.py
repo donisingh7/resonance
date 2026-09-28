@@ -2,6 +2,14 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, TypedDict
 
+# Convention for every `metadata` dict returned below: include a
+# "token_usage" key. MockAIProvider always sets it to None (it makes no
+# real model call, so there is nothing to report — never invent a number).
+# A future real provider should populate it with an actual usage summary
+# (e.g. {"prompt_tokens": int, "completion_tokens": int}) using this same
+# key, so callers/evaluation tooling have one stable place to look instead
+# of a field that silently doesn't exist for mock output.
+
 
 class TranscriptionResult(TypedDict):
     transcript: str

@@ -11,3 +11,7 @@ pypdf==6.19.0
 hachoir==3.4.0
 charset-normalizer==3.5.1
 reportlab==5.0.1
+
+# Testing / evaluation harness (S7) — TestClient (httpx) + pytest.
+pytest==9.1.1
+httpx==0.28.1
