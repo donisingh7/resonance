@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.core.config import settings
 from app.models.asset import MODALITY_BY_EXTENSION, Asset
+from app.models.intelligence import ProjectIntelligence
 from app.models.processing import ProcessingResult
 from app.models.project import Project
 
@@ -19,6 +20,10 @@ class AssetNotFoundError(Exception):
 
 
 class ProcessingResultNotFoundError(Exception):
+    pass
+
+
+class ProjectIntelligenceNotFoundError(Exception):
     pass
 
 
@@ -62,6 +67,14 @@ def _processing_result_file(project_id: str, result_id: str) -> Path:
     return _processing_results_dir(project_id) / f"{result_id}.json"
 
 
+def _intelligence_dir(project_id: str) -> Path:
+    return _project_dir(project_id) / "intelligence"
+
+
+def _intelligence_file(project_id: str, intelligence_id: str) -> Path:
+    return _intelligence_dir(project_id) / f"{intelligence_id}.json"
+
+
 def runtime_tmp_dir() -> Path:
     """Scratch space for transient files (e.g. video keyframe/audio extraction).
 
@@ -81,8 +94,9 @@ def create_project(name: str, description: str) -> Project:
     uploads_dir(project.id).mkdir(parents=True, exist_ok=True)
     _assets_dir(project.id).mkdir(parents=True, exist_ok=True)
     _processing_results_dir(project.id).mkdir(parents=True, exist_ok=True)
+    _intelligence_dir(project.id).mkdir(parents=True, exist_ok=True)
 
-    _project_file(project.id).write_text(project.model_dump_json(indent=2))
+    _project_file(project.id).write_text(project.model_dump_json(indent=2), encoding="utf-8")
     return project
 
 
@@ -91,7 +105,7 @@ def get_project(project_id: str) -> Project:
     if not project_file.exists():
         raise ProjectNotFoundError(project_id)
 
-    return Project.model_validate_json(project_file.read_text())
+    return Project.model_validate_json(project_file.read_text(encoding="utf-8"))
 
 
 def safe_stored_filename(original_filename: str, extension: str) -> str:
@@ -127,7 +141,9 @@ def write_uploaded_file(project_id: str, original_filename: str, content: bytes)
 def save_asset(asset: Asset) -> None:
     assets_dir = _assets_dir(asset.project_id)
     assets_dir.mkdir(parents=True, exist_ok=True)
-    _asset_file(asset.project_id, asset.id).write_text(asset.model_dump_json(indent=2))
+    _asset_file(asset.project_id, asset.id).write_text(
+        asset.model_dump_json(indent=2), encoding="utf-8"
+    )
 
 
 def get_asset(project_id: str, asset_id: str) -> Asset:
@@ -137,7 +153,7 @@ def get_asset(project_id: str, asset_id: str) -> Asset:
     if not asset_file.exists():
         raise AssetNotFoundError(asset_id)
 
-    return Asset.model_validate_json(asset_file.read_text())
+    return Asset.model_validate_json(asset_file.read_text(encoding="utf-8"))
 
 
 def list_assets(project_id: str) -> list[Asset]:
@@ -148,7 +164,7 @@ def list_assets(project_id: str) -> list[Asset]:
         return []
 
     assets = [
-        Asset.model_validate_json(asset_file.read_text())
+        Asset.model_validate_json(asset_file.read_text(encoding="utf-8"))
         for asset_file in sorted(assets_dir.glob("*.json"))
     ]
     return sorted(assets, key=lambda asset: asset.created_at)
@@ -158,7 +174,7 @@ def save_processing_result(result: ProcessingResult) -> None:
     results_dir = _processing_results_dir(result.project_id)
     results_dir.mkdir(parents=True, exist_ok=True)
     _processing_result_file(result.project_id, result.id).write_text(
-        result.model_dump_json(indent=2)
+        result.model_dump_json(indent=2), encoding="utf-8"
     )
 
 
@@ -169,7 +185,7 @@ def get_processing_result(project_id: str, result_id: str) -> ProcessingResult:
     if not result_file.exists():
         raise ProcessingResultNotFoundError(result_id)
 
-    return ProcessingResult.model_validate_json(result_file.read_text())
+    return ProcessingResult.model_validate_json(result_file.read_text(encoding="utf-8"))
 
 
 def list_processing_results(project_id: str) -> list[ProcessingResult]:
@@ -180,7 +196,39 @@ def list_processing_results(project_id: str) -> list[ProcessingResult]:
         return []
 
     results = [
-        ProcessingResult.model_validate_json(result_file.read_text())
+        ProcessingResult.model_validate_json(result_file.read_text(encoding="utf-8"))
         for result_file in sorted(results_dir.glob("*.json"))
+    ]
+    return sorted(results, key=lambda result: result.created_at)
+
+
+def save_project_intelligence(intelligence: ProjectIntelligence) -> None:
+    intelligence_dir = _intelligence_dir(intelligence.project_id)
+    intelligence_dir.mkdir(parents=True, exist_ok=True)
+    _intelligence_file(intelligence.project_id, intelligence.id).write_text(
+        intelligence.model_dump_json(indent=2), encoding="utf-8"
+    )
+
+
+def get_project_intelligence(project_id: str, intelligence_id: str) -> ProjectIntelligence:
+    get_project(project_id)
+
+    intelligence_file = _intelligence_file(project_id, intelligence_id)
+    if not intelligence_file.exists():
+        raise ProjectIntelligenceNotFoundError(intelligence_id)
+
+    return ProjectIntelligence.model_validate_json(intelligence_file.read_text(encoding="utf-8"))
+
+
+def list_project_intelligence(project_id: str) -> list[ProjectIntelligence]:
+    get_project(project_id)
+
+    intelligence_dir = _intelligence_dir(project_id)
+    if not intelligence_dir.exists():
+        return []
+
+    results = [
+        ProjectIntelligence.model_validate_json(intelligence_file.read_text(encoding="utf-8"))
+        for intelligence_file in sorted(intelligence_dir.glob("*.json"))
     ]
     return sorted(results, key=lambda result: result.created_at)

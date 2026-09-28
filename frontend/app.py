@@ -178,5 +178,111 @@ if active_project:
                             st.json(result["modality_metadata"])
         else:
             st.error(f"Failed to load assets: {assets_resp.status_code} {assets_resp.text}")
+
+    st.divider()
+    st.subheader("Project intelligence")
+
+    if assets_resp is not None and assets_resp.status_code == 200:
+        assets = assets_resp.json()
+        completed_count = sum(
+            1 for r in results_by_asset.values() if r.get("status") == "completed"
+        )
+        st.caption(
+            f"{len(assets)} asset(s) ingested · {completed_count} with a completed "
+            f"processing result."
+        )
+
+    if st.button("Generate Project Intelligence"):
+        try:
+            gen_resp = requests.post(
+                f"{BACKEND_URL}/projects/{active_project['id']}/intelligence",
+                json={},
+                timeout=60,
+            )
+            if gen_resp.status_code == 200:
+                st.success("Project intelligence generated.")
+                st.rerun()
+            else:
+                st.error(f"Generation failed: {gen_resp.status_code} {gen_resp.text}")
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Could not reach backend: {exc}")
+
+    try:
+        intel_resp = requests.get(
+            f"{BACKEND_URL}/projects/{active_project['id']}/intelligence", timeout=5
+        )
+    except requests.exceptions.RequestException as exc:
+        intel_resp = None
+        st.error(f"Could not reach backend: {exc}")
+
+    if intel_resp is not None:
+        if intel_resp.status_code == 200:
+            intelligence_records = intel_resp.json()
+            if not intelligence_records:
+                st.info("No project intelligence generated yet.")
+            else:
+                intelligence_records = sorted(
+                    intelligence_records, key=lambda r: r["created_at"], reverse=True
+                )
+                for record in intelligence_records:
+                    label = f"{record['provider']} — {record['status']} — {record['created_at']}"
+                    with st.expander(label, expanded=(record is intelligence_records[0])):
+                        if record["status"] == "failed":
+                            st.error(f"Intelligence generation error: {record['error']}")
+                            continue
+
+                        if record["provider"] == "mock":
+                            st.caption(
+                                "MockAIProvider output: deterministic placeholder synthesis "
+                                "for architecture/flow verification, not real AI analysis."
+                            )
+
+                        st.markdown("**Summary**")
+                        st.write(record["summary"])
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("**Top themes**")
+                            for item in record["top_themes"]:
+                                st.write(f"- {item}")
+                            st.markdown("**Pain points**")
+                            for item in record["pain_points"]:
+                                st.write(f"- {item}")
+                            st.markdown("**Opportunities**")
+                            for item in record["opportunities"]:
+                                st.write(f"- {item}")
+                        with col2:
+                            st.markdown("**Sentiment summary**")
+                            st.write(record["sentiment_summary"])
+                            st.markdown("**Positive signals**")
+                            for item in record["positive_signals"]:
+                                st.write(f"- {item}")
+                            st.markdown("**Recommended actions**")
+                            for item in record["recommended_actions"]:
+                                st.write(f"- {item}")
+
+                        st.markdown("**Questions / concerns**")
+                        for item in record["questions_or_concerns"]:
+                            st.write(f"- {item}")
+
+                        st.markdown(f"**Evidence** ({len(record['evidence'])} item(s))")
+                        for evidence_item in record["evidence"]:
+                            st.markdown(
+                                f"- **[{evidence_item['category']}]** {evidence_item['statement']}"
+                            )
+                            st.caption(
+                                f"Source: {evidence_item['source_filename']} · "
+                                f"asset_id={evidence_item['asset_id']} · "
+                                f"processing_result_id={evidence_item['processing_result_id']}"
+                            )
+                            if evidence_item.get("excerpt"):
+                                st.code(evidence_item["excerpt"], language=None)
+
+                        st.caption(
+                            f"Source processing results: "
+                            f"{', '.join(record['source_result_ids']) or 'none'}"
+                        )
+        else:
+            st.error(f"Failed to load project intelligence: {intel_resp.status_code} {intel_resp.text}")
 else:
     st.info("Create or load a project to upload files.")
