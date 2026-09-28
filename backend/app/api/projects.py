@@ -1,5 +1,6 @@
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
+from app.core.config import settings
 from app.models.asset import Asset
 from app.models.project import Project, ProjectCreateRequest
 from app.services import ingestion, storage
@@ -12,6 +13,11 @@ def create_project(payload: ProjectCreateRequest):
     return storage.create_project(payload.name, payload.description)
 
 
+@router.get("", response_model=list[Project])
+def list_projects():
+    return storage.list_projects()
+
+
 @router.get("/{project_id}", response_model=Project)
 def get_project(project_id: str):
     try:
@@ -22,7 +28,19 @@ def get_project(project_id: str):
 
 @router.post("/{project_id}/upload", response_model=Asset)
 async def upload_file(project_id: str, file: UploadFile = File(...)):
-    content = await file.read()
+    max_bytes = settings.max_upload_size_mb * 1024 * 1024
+    # Read at most one byte beyond the limit: enough to detect an oversize
+    # upload without holding an unbounded amount of attacker-controlled
+    # data in memory first.
+    content = await file.read(max_bytes + 1)
+
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds the maximum upload size of {settings.max_upload_size_mb} MB.",
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     try:
         return ingestion.ingest_uploaded_file(project_id, file.filename, content)

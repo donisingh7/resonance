@@ -1,0 +1,6 @@
+Overall the product has been helpful, but there is a recurring problem with the
+export feature: it fails intermittently and is quite slow during peak hours.
+Some users are confused by the settings page and find it difficult to locate
+notification preferences. How can we improve export reliability going forward?
+What is the realistic timeline for fixing the crash on large file uploads?
+Despite these issues, the support team has been very responsive and helpful.
