@@ -101,34 +101,82 @@ if active_project:
             st.success(f"Uploaded and ingested {len(results)} file(s).")
 
     st.subheader("Ingested assets")
-    if st.button("Refresh assets"):
-        pass  # button click alone triggers a rerun, which re-fetches below
+    st.button("Refresh assets")  # click alone triggers a rerun, which re-fetches below
 
     try:
-        resp = requests.get(
+        assets_resp = requests.get(
             f"{BACKEND_URL}/projects/{active_project['id']}/assets", timeout=5
         )
-        if resp.status_code == 200:
-            assets = resp.json()
-            if assets:
-                rows = [
-                    {
-                        "id": a["id"],
-                        "original_filename": a["original_filename"],
-                        "modality": a["modality"],
-                        "mime_type": a["mime_type"],
-                        "size_bytes": a["size_bytes"],
-                        "ingestion_status": a["ingestion_status"],
-                        "technical_metadata": a["technical_metadata"],
-                    }
-                    for a in assets
-                ]
-                st.table(rows)
-            else:
-                st.info("No assets ingested yet for this project.")
-        else:
-            st.error(f"Failed to load assets: {resp.status_code} {resp.text}")
     except requests.exceptions.RequestException as exc:
+        assets_resp = None
         st.error(f"Could not reach backend: {exc}")
+
+    try:
+        results_resp = requests.get(
+            f"{BACKEND_URL}/projects/{active_project['id']}/processing-results", timeout=5
+        )
+        results_by_asset = (
+            {r["asset_id"]: r for r in results_resp.json()}
+            if results_resp is not None and results_resp.status_code == 200
+            else {}
+        )
+    except requests.exceptions.RequestException:
+        results_by_asset = {}
+
+    if assets_resp is not None:
+        if assets_resp.status_code == 200:
+            assets = assets_resp.json()
+            if not assets:
+                st.info("No assets ingested yet for this project.")
+
+            for asset in assets:
+                result = results_by_asset.get(asset["id"])
+                status_label = result["status"] if result else "not processed"
+
+                with st.expander(
+                    f"{asset['original_filename']} — {asset['modality']} — {status_label}"
+                ):
+                    st.caption(
+                        f"mime: {asset['mime_type']} · size: {asset['size_bytes']} bytes · "
+                        f"ingestion: {asset['ingestion_status']}"
+                    )
+                    st.json(asset["technical_metadata"])
+
+                    if st.button("Process asset", key=f"process_{asset['id']}"):
+                        try:
+                            process_resp = requests.post(
+                                f"{BACKEND_URL}/projects/{active_project['id']}"
+                                f"/assets/{asset['id']}/process",
+                                timeout=120,
+                            )
+                            if process_resp.status_code == 200:
+                                st.success("Processing complete.")
+                                st.rerun()
+                            else:
+                                st.error(
+                                    f"Processing failed: "
+                                    f"{process_resp.status_code} {process_resp.text}"
+                                )
+                        except requests.exceptions.RequestException as exc:
+                            st.error(f"Could not reach backend: {exc}")
+
+                    if result:
+                        st.markdown(f"**Provider:** {result['provider']}")
+                        if result["status"] == "failed":
+                            st.error(f"Processing error: {result['error']}")
+                        else:
+                            if result["transcript"]:
+                                st.markdown("**Transcript**")
+                                st.write(result["transcript"])
+                            if result["extracted_text"]:
+                                st.markdown("**Extracted text**")
+                                st.write(result["extracted_text"])
+                            if result["visual_description"]:
+                                st.markdown("**Visual description**")
+                                st.write(result["visual_description"])
+                            st.markdown("**Modality metadata**")
+                            st.json(result["modality_metadata"])
+        else:
+            st.error(f"Failed to load assets: {assets_resp.status_code} {assets_resp.text}")
 else:
     st.info("Create or load a project to upload files.")

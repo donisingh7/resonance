@@ -1,7 +1,8 @@
 from fastapi import APIRouter, HTTPException
 
 from app.models.asset import Asset
-from app.services import storage
+from app.models.processing import ProcessingResult
+from app.services import processing, storage
 
 router = APIRouter(prefix="/projects/{project_id}/assets", tags=["assets"])
 
@@ -18,6 +19,16 @@ def list_assets(project_id: str):
 def get_asset(project_id: str, asset_id: str):
     try:
         return storage.get_asset(project_id, asset_id)
+    except storage.ProjectNotFoundError:
+        raise HTTPException(status_code=404, detail="Project not found")
+    except storage.AssetNotFoundError:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+
+@router.post("/{asset_id}/process", response_model=ProcessingResult)
+def process_asset(project_id: str, asset_id: str):
+    try:
+        return processing.process_asset(project_id, asset_id)
     except storage.ProjectNotFoundError:
         raise HTTPException(status_code=404, detail="Project not found")
     except storage.AssetNotFoundError:

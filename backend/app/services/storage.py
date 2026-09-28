@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.core.config import settings
 from app.models.asset import MODALITY_BY_EXTENSION, Asset
+from app.models.processing import ProcessingResult
 from app.models.project import Project
 
 ALLOWED_EXTENSIONS = set(MODALITY_BY_EXTENSION)
@@ -14,6 +15,10 @@ class ProjectNotFoundError(Exception):
 
 
 class AssetNotFoundError(Exception):
+    pass
+
+
+class ProcessingResultNotFoundError(Exception):
     pass
 
 
@@ -49,6 +54,25 @@ def _asset_file(project_id: str, asset_id: str) -> Path:
     return _assets_dir(project_id) / f"{asset_id}.json"
 
 
+def _processing_results_dir(project_id: str) -> Path:
+    return _project_dir(project_id) / "processing_results"
+
+
+def _processing_result_file(project_id: str, result_id: str) -> Path:
+    return _processing_results_dir(project_id) / f"{result_id}.json"
+
+
+def runtime_tmp_dir() -> Path:
+    """Scratch space for transient files (e.g. video keyframe/audio extraction).
+
+    Lives under the gitignored data directory. Callers are responsible for
+    cleaning up whatever subdirectory they create here.
+    """
+    tmp_dir = Path(settings.data_dir) / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir
+
+
 def create_project(name: str, description: str) -> Project:
     project = Project(id=str(uuid.uuid4()), name=name, description=description)
 
@@ -56,6 +80,7 @@ def create_project(name: str, description: str) -> Project:
     project_dir.mkdir(parents=True, exist_ok=True)
     uploads_dir(project.id).mkdir(parents=True, exist_ok=True)
     _assets_dir(project.id).mkdir(parents=True, exist_ok=True)
+    _processing_results_dir(project.id).mkdir(parents=True, exist_ok=True)
 
     _project_file(project.id).write_text(project.model_dump_json(indent=2))
     return project
@@ -127,3 +152,35 @@ def list_assets(project_id: str) -> list[Asset]:
         for asset_file in sorted(assets_dir.glob("*.json"))
     ]
     return sorted(assets, key=lambda asset: asset.created_at)
+
+
+def save_processing_result(result: ProcessingResult) -> None:
+    results_dir = _processing_results_dir(result.project_id)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    _processing_result_file(result.project_id, result.id).write_text(
+        result.model_dump_json(indent=2)
+    )
+
+
+def get_processing_result(project_id: str, result_id: str) -> ProcessingResult:
+    get_project(project_id)
+
+    result_file = _processing_result_file(project_id, result_id)
+    if not result_file.exists():
+        raise ProcessingResultNotFoundError(result_id)
+
+    return ProcessingResult.model_validate_json(result_file.read_text())
+
+
+def list_processing_results(project_id: str) -> list[ProcessingResult]:
+    get_project(project_id)
+
+    results_dir = _processing_results_dir(project_id)
+    if not results_dir.exists():
+        return []
+
+    results = [
+        ProcessingResult.model_validate_json(result_file.read_text())
+        for result_file in sorted(results_dir.glob("*.json"))
+    ]
+    return sorted(results, key=lambda result: result.created_at)
