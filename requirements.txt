@@ -12,6 +12,10 @@ hachoir==3.4.0
 charset-normalizer==3.5.1
 reportlab==5.0.1
 
+# Real OpenAI provider adapter (P1.2). Only used when AI_PROVIDER=openai;
+# mock mode never imports/calls it beyond class definition.
+openai==3.20.0
+
 # Testing / evaluation harness (S7) — TestClient (httpx) + pytest.
 pytest==9.1.1
 httpx==0.28.1

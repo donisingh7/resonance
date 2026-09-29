@@ -119,14 +119,41 @@ compatible licensing.
       interface: `transcribe_audio`, `analyze_image`, `synthesize_project`
       (S4), and — since S5 — `generate_questionnaire` for follow-up
       questions), `mock_provider.py` (deterministic default, no external
-      calls), `__init__.py` (`get_ai_provider()` factory, provider selected
-      via `settings.ai_provider`). Add a real provider as a new module here
-      and register it in the factory; don't touch `processing.py`'s,
-      `intelligence.py`'s, or `questionnaire.py`'s dispatch logic to add a
-      provider. Every metadata dict returned here includes a `token_usage`
-      key, explicitly `None` for `MockAIProvider` (it makes no real model
-      call) — a future real provider should populate the same key rather
-      than inventing a number or omitting it.
+      calls), `openai_provider.py` (P1.2 — real OpenAI-backed adapter, see
+      below), `__init__.py` (`get_ai_provider()` factory: `"mock"` →
+      `MockAIProvider`, `"openai"` → `OpenAIProvider`, provider selected via
+      `settings.ai_provider`; an unknown name raises `ValueError`). Add
+      another real provider the same way — a new module here, registered in
+      the factory; don't touch `processing.py`'s, `intelligence.py`'s, or
+      `questionnaire.py`'s dispatch logic to add one. Every metadata dict
+      returned here includes a `token_usage` key: `None` for
+      `MockAIProvider` (it makes no real model call), and for
+      `OpenAIProvider` either the real SDK-reported usage dict or `None` if
+      the API didn't return one — never a fabricated number either way.
+    - `openai_provider.py` (P1.2) — `OpenAIProvider`, the first real
+      `AIProvider` implementation. **Code exists; no real credential/live
+      smoke test has been run against it yet** — see
+      `docs/BUILD_STATUS.md`. Only instantiated when `AI_PROVIDER=openai`;
+      its `__init__` validates `OPENAI_API_KEY`/`OPENAI_TEXT_MODEL`/
+      `OPENAI_TRANSCRIBE_MODEL` are set and raises `OpenAIConfigurationError`
+      (a `ValueError` subclass, so the existing readiness check catches it
+      with no changes needed there) if any are missing — model names are
+      never hardcoded as a fallback in business logic, since availability
+      changes over time. Uses the SDK's `responses.parse(...,
+      text_format=<pydantic model>)` structured-output parsing (schemas
+      internal to this module — `base.py`'s public TypedDict contract is
+      unchanged) rather than free-form JSON parsing, so malformed output
+      raises `OpenAIProviderError` instead of being guessed at. Defensively
+      re-validates every returned evidence item (`asset_id`/
+      `processing_result_id`/`source_filename` must exactly match a
+      supplied context entry, `excerpt` must be a real substring of that
+      asset's text) and every question's `related_theme` (must be literal
+      text from the supplied intelligence) — invalid ones are dropped, never
+      "corrected," before the result reaches `intelligence.py`/
+      `questionnaire.py`'s own (coarser) existing filters. Constructing the
+      SDK client (`OpenAI(api_key=...)`) makes no network call, so this is
+      also what `/ready` uses to validate config in `openai` mode without
+      spending a real API call.
     - `readiness.py` — the capability/readiness service (S7). Runs a small,
       fixed set of local checks (data directory writable, configured AI
       provider resolves, ffmpeg/hachoir importable) and reports them as a
@@ -235,9 +262,13 @@ compatible licensing.
   (text encoding detection)
 - AI processing (S3), cross-asset intelligence (S4), and questionnaire
   generation (S5): all provider-abstracted (`ai_providers/`); `MockAIProvider`
-  is the default and only implemented provider — deterministic, no external
-  calls or credentials required. ffmpeg/ffprobe (system binaries, not pip
-  packages) used for video audio/keyframe extraction.
+  is the default provider — deterministic, no external calls or credentials
+  required. `OpenAIProvider` (P1.2, `openai` Python SDK) is a second,
+  real implementation, selected via `AI_PROVIDER=openai` plus
+  `OPENAI_API_KEY`/`OPENAI_TEXT_MODEL`/`OPENAI_TRANSCRIBE_MODEL` — code
+  exists and is unit-tested with stubs, but **no live credential/API smoke
+  test has been run against it yet**. ffmpeg/ffprobe (system binaries, not
+  pip packages) used for video audio/keyframe extraction.
 - PDF rendering (S5): `reportlab` (platypus), pure-Python, no system
   dependency. Used only to render an already-built `ExecutiveReport` to
   PDF — it has no role in generating report content.
@@ -253,11 +284,13 @@ compatible licensing.
 ## Coding rules
 
 - Keep it simple; don't add abstractions, DB layers, or infra ahead of need.
-- AI-dependent operations (transcription, vision) go through the
-  `ai_providers` abstraction and default to `MockAIProvider`. Do not wire up
-  a real cloud provider (credentials, Whisper, OCR, vision APIs, LLM calls)
-  until explicitly scoped in a future phase — the interface exists so that
-  can be added later without touching `processing.py`'s dispatch logic.
+- AI-dependent operations (transcription, vision, synthesis, questionnaire
+  generation) go through the `ai_providers` abstraction and default to
+  `MockAIProvider`. `OpenAIProvider` (P1.2) exists behind the same
+  interface but must never be made the default, instantiated implicitly, or
+  called with a real credential outside an explicit, deliberate live smoke
+  test — do not add a third provider or extend the interface further until
+  explicitly scoped.
 - Processing (S3) is per-asset only; cross-asset synthesis (S4) and
   questionnaire/report generation (S5) are separate service layers on top
   of it, not folded into `processing.py`. Do not add embeddings, vector
@@ -371,11 +404,16 @@ compatible licensing.
    `docs/BUILD_STATUS.md` for exact scope. **This was the final planned
    main development phase** — see `docs/BUILD_STATUS.md` for what remains
    for an actual deployment phase (P1+).
-7. Database migration, authentication, cloud deployment, embeddings/vector
-   DB, RAG, real external provider credentials, final evaluation benchmark
+7. **P1 — deployment phase, in progress.** P1.1 (baseline verification)
+   done. ~~P1.2 — real OpenAI provider adapter~~ — **code done, not
+   live-tested**: `OpenAIProvider` implements the full `AIProvider`
+   interface behind `AI_PROVIDER=openai`; `MockAIProvider` remains the
+   default and is unaffected. No real API key has been used yet — see
+   `docs/BUILD_STATUS.md` for exactly what is/isn't verified. Not started:
+   a live credential smoke test, database migration, authentication, cloud
+   deployment, embeddings/vector DB, RAG, a final evaluation benchmark
    against a real provider, large automated test suite beyond the S7
    critical-path suite, comprehensive security hardening beyond S7's
-   pragmatic pass, Kubernetes/Terraform, elaborate monitoring stack — not
-   started, deliberately deferred from S7 to a later deployment phase (P1+)
+   pragmatic pass, Kubernetes/Terraform, elaborate monitoring stack.
 
 Do not start a phase early — follow explicit instructions per step.
