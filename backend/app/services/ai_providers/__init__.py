@@ -1,11 +1,11 @@
 from app.core.config import settings
 from app.services.ai_providers.base import AIProvider
 from app.services.ai_providers.mock_provider import MockAIProvider
+from app.services.ai_providers.openai_provider import OpenAIProvider
 
 _PROVIDERS: dict[str, type[AIProvider]] = {
     "mock": MockAIProvider,
-    # Register a real provider here later, e.g. "anthropic": AnthropicProvider,
-    # once cloud credentials and an adapter implementing AIProvider exist.
+    "openai": OpenAIProvider,
 }
 
 

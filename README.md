@@ -11,14 +11,17 @@ Bosch code, data, tooling, or proprietary material from any prior employer.
 Every line here is original or built on open-source libraries with
 compatible licenses.
 
-**Current status: fully mock-mode.** All AI-derived content (transcripts,
-image descriptions, themes, sentiment, questionnaire questions, report
-summaries) comes from a deterministic `MockAIProvider` — word-frequency
-counting and fixed keyword lists, not a real model. This is by design: the
-project proves out the full architecture, evidence traceability, and
-workflow orchestration end-to-end before any real AI credentials are
-introduced. See [Current limitations](#current-limitations) for the exact
-line between what's real and what's mock.
+**Current status: mock-mode by default, no live AI has been run yet.** All
+AI-derived content produced so far (transcripts, image descriptions,
+themes, sentiment, questionnaire questions, report summaries) comes from a
+deterministic `MockAIProvider` — word-frequency counting and fixed keyword
+lists, not a real model. A real `OpenAIProvider` adapter now exists behind
+the same `AIProvider` interface (`AI_PROVIDER=openai`), but **no live
+request has been made against a real OpenAI API key yet** — it's code-
+complete and unit-tested with stubs only. `MockAIProvider` remains the
+default; nothing changes unless you explicitly opt into `openai` mode and
+supply your own key. See [Current limitations](#current-limitations) for
+the exact line between what's real and what's mock/untested.
 
 ## What actually works today
 
@@ -48,7 +51,9 @@ line between what's real and what's mock.
 | Audio | `.mp3`, `.wav` | Duration/sample rate/channels (mutagen) | Transcription (provider) |
 | Video | `.mp4` | Duration/dimensions (hachoir); audio+keyframe extraction (ffmpeg) | Transcription + per-frame description (provider) |
 
-"Provider" is `MockAIProvider` today — see [Current limitations](#current-limitations).
+"Provider" is `MockAIProvider` by default; `OpenAIProvider` exists behind
+the same interface (`AI_PROVIDER=openai`) but has not been live-tested —
+see [Current limitations](#current-limitations).
 
 ## Architecture
 
@@ -157,6 +162,25 @@ streamlit run frontend/app.py
 Backend health check: <http://localhost:8000/health> · readiness/capability
 report: <http://localhost:8000/ready>.
 
+### Using the real OpenAI provider (optional, untested against a live key)
+
+`AI_PROVIDER=mock` is the default and needs nothing further. To try the
+real `OpenAIProvider` adapter, set in `.env`:
+
+```
+AI_PROVIDER=openai
+OPENAI_API_KEY=sk-...           # your own key — never commit this
+OPENAI_TEXT_MODEL=...           # e.g. a current GPT model; not hardcoded in code
+OPENAI_TRANSCRIBE_MODEL=...     # e.g. a current transcription model
+```
+
+`GET /ready` will report `ai_provider_configured: false` (HTTP 503) with a
+clear message if any of these are missing, without making any API call.
+**This adapter has not yet been exercised against a real OpenAI account in
+this project** — only unit-tested with stubs (see
+`backend/tests/test_openai_provider.py`). Use it at your own discretion and
+cost.
+
 ## Running the evaluation harness
 
 A small, reproducible **engineering/pipeline** evaluation (not an AI-quality
@@ -167,11 +191,13 @@ disposable temp project:
 .venv\Scripts\python.exe scripts\evaluate.py
 ```
 
-See `evaluation/README.md` for exactly what it measures (files
-ingested/processed, workflow completion, evidence integrity, idempotency,
-questionnaire-edit preservation, PDF generation, latency) and what it
-explicitly does **not** claim (semantic accuracy, transcription/vision
-quality — those require a real provider, not yet integrated).
+Always runs against `MockAIProvider`. See `evaluation/README.md` for
+exactly what it measures (files ingested/processed, workflow completion,
+evidence integrity, idempotency, questionnaire-edit preservation, PDF
+generation, latency) and what it explicitly does **not** claim (semantic
+accuracy, transcription/vision quality — those require a live run against
+a real provider, which has not been done yet even though `OpenAIProvider`
+code now exists).
 
 ## Running the automated tests
 
@@ -182,15 +208,20 @@ quality — those require a real provider, not yet integrated).
 A focused regression suite (not a push for coverage) covering upload
 validation, path-traversal safety, project isolation, processing failure
 isolation, workflow idempotency, evidence integrity, questionnaire-edit
-preservation, and report/PDF generation.
+preservation, report/PDF generation, and (since P1.2) `OpenAIProvider`'s
+configuration handling and request/response mapping via stubs — no test in
+this suite ever makes a real network call.
 
 ## Current limitations
 
-- **All AI-derived content is `MockAIProvider` output** — deterministic
-  keyword/word-frequency heuristics, not real transcription, vision, or
-  language understanding. Every mock-derived string is labeled `[mock]` in
-  the data itself, and the UI/reports flag this explicitly
-  (`mock_provider_output` risk flag on every report).
+- **All AI-derived content produced so far is `MockAIProvider` output** —
+  deterministic keyword/word-frequency heuristics, not real transcription,
+  vision, or language understanding. Every mock-derived string is labeled
+  `[mock]` in the data itself, and the UI/reports flag this explicitly
+  (`mock_provider_output` risk flag on every report). A real
+  `OpenAIProvider` exists (`AI_PROVIDER=openai`) but **has not been
+  live-tested against a real API key** — do not treat its presence in the
+  codebase as evidence of real-AI validation.
 - No database — file-based JSON persistence under `data/`, which must live
   on a durable filesystem/volume in any real deployment (see
   `docs/DEPLOYMENT.md`).

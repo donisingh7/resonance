@@ -1,12 +1,126 @@
 # Resonance — Build Status
 
-Last updated: 2026-09-28 (S7 / R6 — hardening, evaluation harness, observability, deployment readiness)
+Last updated: 2026-09-29 (P1.2 — real OpenAI provider adapter, code-complete, not live-tested)
+
+**S7 was the final planned main development phase.** P1 is the deployment
+phase that follows it. P1.1 (baseline verification on `main`: clean tree,
+19/19 pytest, evaluation harness PASS) is done. **P1.2, described below, adds
+a real `OpenAIProvider` behind the existing `AIProvider` interface — the
+code exists and is unit-tested with stubs, but no real OpenAI API key has
+been used and no live API request has been made.** `MockAIProvider` remains
+the default provider and this phase changes nothing about its behavior.
+
+## P1.2 — Real OpenAI provider adapter
+
+### What was added
+
+- **Configuration** (`backend/app/core/config.py`, `.env.example`):
+  `AI_PROVIDER` now also accepts `"openai"` (default remains `"mock"`).
+  Three new settings, all `None` by default and all required together when
+  `AI_PROVIDER=openai`: `OPENAI_API_KEY`, `OPENAI_TEXT_MODEL`,
+  `OPENAI_TRANSCRIBE_MODEL`. Model names have **no hardcoded fallback**
+  anywhere in business logic — they must come from `.env`, since model
+  availability changes over time. `.env.example` contains commented
+  placeholders/examples only, never a real key.
+- **`backend/app/services/ai_providers/openai_provider.py`** —
+  `OpenAIProvider`, implementing the same `AIProvider` interface as
+  `MockAIProvider` (`transcribe_audio`, `analyze_image`,
+  `synthesize_project`, `generate_questionnaire`) with **zero changes** to
+  the public interface in `base.py`. Uses the official `openai` Python SDK
+  (`openai==3.20.0`, added to `requirements.txt`):
+  - **Audio** → `client.audio.transcriptions.create(model=OPENAI_TRANSCRIBE_MODEL, file=...)`.
+  - **Image** → `client.responses.parse(model=OPENAI_TEXT_MODEL, input=[...with an input_image data URL...], text_format=<schema>)`,
+    asking for OCR-like extracted text (nullable) and a concise visual
+    description.
+  - **Project synthesis** and **questionnaire generation** → the same
+    `responses.parse(..., text_format=<schema>)` structured-output pattern,
+    using schema-validated Pydantic models (defined locally in this module,
+    not exported) instead of free-form JSON parsing — malformed output
+    raises `OpenAIProviderError` rather than being guessed at or silently
+    replaced with mock content.
+  - **Evidence/related-theme integrity, defensively re-checked here**: every
+    returned evidence item's `asset_id`/`processing_result_id`/
+    `source_filename` must exactly match one of the asset contexts actually
+    passed in, and its `excerpt` (if any) must be a real substring of that
+    asset's own text — anything else is dropped (counted in
+    `metadata.evidence_dropped_invalid_reference_count`), never "corrected."
+    Same treatment for a generated question's `related_theme`: it's kept
+    only if it's literal text from the supplied intelligence context,
+    otherwise the question is dropped (counted in
+    `metadata.questions_dropped_invalid_related_theme_count`). This is in
+    addition to — not a replacement for — `intelligence.py`'s own existing
+    (coarser) `processing_result_id` filter, which is unchanged.
+  - **Token usage**: every metadata dict's `token_usage` is either the
+    real dict the SDK returned (`response.usage.model_dump()` /
+    `transcription.usage.model_dump()`) or `None` if the SDK didn't return
+    one — never a fabricated number, preserving the convention established
+    in S7 for `MockAIProvider`.
+- **Configuration failure handling**: `OpenAIProvider.__init__` checks all
+  three required settings and raises `OpenAIConfigurationError` (a
+  `ValueError` subclass) naming exactly which are missing — by env var
+  name only, never a value — if any are absent. This is deliberately a
+  `ValueError` subclass so the **existing** `_check_ai_provider_configured()`
+  in `readiness.py` (unchanged) catches it automatically.
+- **Provider registry** (`ai_providers/__init__.py`): `_PROVIDERS` now maps
+  `"mock" → MockAIProvider` and `"openai" → OpenAIProvider`. An unknown
+  provider name still raises a clear `ValueError`. Registering the class
+  does not instantiate it — `AI_PROVIDER=mock` never touches any OpenAI
+  setting or imports the `openai` package's client beyond the class
+  definition existing.
+- **`/ready` behavior** (`backend/app/api/readiness.py`,
+  `services/readiness.py` — **unchanged, no new code needed**): the
+  existing `ai_provider_configured` check calls `get_ai_provider()`, which
+  now naturally exercises `OpenAIProvider.__init__`'s validation. In
+  `mock` mode, `/ready` is completely unaffected by OpenAI settings being
+  unset (verified by test). In `openai` mode, `/ready` reports
+  `ai_provider_configured: false` with the missing-config detail if
+  `OPENAI_API_KEY` (etc.) is absent, or `true` once all three are set —
+  **without making any network call**, since constructing
+  `openai.OpenAI(api_key=...)` is local-only (verified interactively and
+  covered by a test).
+- **Tests** (`backend/tests/test_openai_provider.py`, 11 new tests, no
+  real network calls anywhere): mock resolves with no OpenAI config;
+  `AI_PROVIDER=openai` resolves `OpenAIProvider`; missing key raises a
+  clear config error without leaking the (fake) key value; unknown
+  provider name fails clearly; `/ready` in mock vs. openai mode (missing
+  key → not ready; configured → ready, no network call); audio
+  transcription response mapping; image analysis response mapping;
+  project synthesis mapping **and** invalid-evidence dropping (asset not
+  in context, excerpt not a real substring, mismatched filename — 3 bad
+  items dropped, 1 valid item kept); questionnaire mapping **and**
+  invalid-related-theme dropping; token usage is the real stubbed value or
+  `None`, never fabricated. All provider-call tests stub
+  `OpenAIProvider._client` directly with a local fake object after
+  constructing the real client (proving construction itself is
+  network-free) — no `openai` SDK method is ever actually invoked.
+
+### What was explicitly NOT done this phase
+
+- **No live OpenAI API request of any kind was made.** No real
+  `OPENAI_API_KEY` was used anywhere, including in tests.
+- No claim is made about real transcription/vision/synthesis/questionnaire
+  quality — that requires an actual live smoke test, which is a distinct,
+  deliberately separate next step (P1.3+), not part of P1.2.
+- `MockAIProvider` was not modified, and remains the default in `.env.example`.
+- No deployment, no database, no authentication — unchanged from S7.
+
+### Verification (measured, this phase)
+
+- `python -m pytest backend/tests -v` → **30 passed** (19 pre-existing +
+  11 new `test_openai_provider.py` tests), 0 failed.
+- `python scripts/evaluate.py` (mock mode, unaffected by this phase) →
+  **Overall: PASS**, all 14 checks green (same harness, same fixtures, run
+  fresh after this phase's changes to confirm nothing regressed).
+
+## S1–S7 implementation (unchanged this phase)
+
+Last updated for S7: 2026-09-28 (S7 / R6 — hardening, evaluation harness, observability, deployment readiness)
 
 **S7 is the final planned main development phase.** All product features
-(S1–S6) are intact and unchanged; this phase only hardened, instrumented,
+(S1–S6) are intact and unchanged; that phase only hardened, instrumented,
 tested, documented, and prepared the existing system — no new user-facing
-functionality was added. See "Code development status" at the end of this
-document.
+functionality was added there. See "Code development status" at the end of
+this document.
 
 ## Implemented
 
@@ -292,9 +406,14 @@ resonance/
 │       ├── evidence_integrity.py  # evidence-reference validator (S7)
 │       ├── video_tools.py
 │       └── ai_providers/          # + token_usage: null convention (S7)
-├── backend/tests/                 # pytest regression suite (S7)
+│           ├── base.py
+│           ├── mock_provider.py
+│           ├── openai_provider.py # OpenAIProvider (P1.2, code-only, not live-tested)
+│           └── __init__.py        # + "openai" registry entry (P1.2)
+├── backend/tests/                 # pytest regression suite (S7) + P1.2
 │   ├── conftest.py
-│   └── test_critical.py
+│   ├── test_critical.py
+│   └── test_openai_provider.py    # P1.2, no real network calls
 ├── evaluation/                    # evaluation harness fixtures + docs (S7)
 │   ├── fixtures/*.txt
 │   └── README.md
@@ -371,16 +490,18 @@ not yet measured; see `evaluation/README.md`).
 
 **Code development for the main phases (S1–S7) is complete.** Every phase
 from foundation (S1) through hardening/evaluation/deployment-readiness
-(S7) has been implemented, smoke- or test-verified, and documented. What
-remains is explicitly a *different kind* of work — a deployment phase
-(P1+): real AI provider integration, a persistent database/object-storage
-backend, authentication, and an actual cloud deployment — none of which
-were in scope for the "code-complete" milestone S7 represents. See
-`CLAUDE.md`'s "High-level future phases" for the exact list.
+(S7) has been implemented, smoke- or test-verified, and documented. P1 (the
+deployment phase) is now in progress: P1.1 (baseline verification) and
+P1.2 (real OpenAI provider adapter, code-complete but not live-tested — see
+above) are both done. See `CLAUDE.md`'s "High-level future phases" for the
+exact list.
 
-## Next phase (not started — a deployment phase, not a coding phase)
+## Next phase (not started)
 
-Real AI provider integration behind the existing `AIProvider` interface,
-database/object-storage migration, authentication, cloud deployment,
-embeddings/vector DB, RAG, Kubernetes/Terraform, elaborate monitoring —
-all deliberately deferred past S7.
+A **live credential smoke test** of `OpenAIProvider` (P1.3+) — running it
+against a real `OPENAI_API_KEY` for the first time — has deliberately not
+been done yet and is the natural next step before any claim about real AI
+quality can be made. Beyond that: a persistent database/object-storage
+backend, authentication, cloud deployment, embeddings/vector DB, RAG,
+Kubernetes/Terraform, elaborate monitoring — all still deliberately
+deferred.
